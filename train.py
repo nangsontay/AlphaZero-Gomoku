@@ -42,14 +42,15 @@ class TrainPipeline():
         self.game = Game(self.board) 
         self.learn_rate = 2e-3
         self.lr_multiplier = 1.0
-        self.temp = 1.0
+        self.temp = None
+        self.temp_schedule = ((30, 1.0), (float("inf"), 1e-3))
         self.n_playout = 400
         self.c_puct = 5
-        self.buffer_size = 10000
+        self.buffer_size = 100000
         self.batch_size = 512
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
-        self.epochs = 5
+        self.epochs = 1
         self.kl_targ = 0.02
         self.check_freq = 50
         self.game_batch_num = 1500
@@ -92,7 +93,8 @@ class TrainPipeline():
         """collect self-play data for training"""
         for i in range(n_games):
             winner, play_data = self.game.start_self_play(self.mcts_player,
-                                                          temp=self.temp)
+                                                          temp=self.temp,
+                                                          temp_schedule=self.temp_schedule)
             play_data = list(play_data)[:]
             self.episode_len = len(play_data)
             play_data = self.get_equi_data(play_data)
@@ -118,8 +120,8 @@ class TrainPipeline():
             )
             if kl > self.kl_targ * 4:
                 break
-        if kl > self.kl_targ * 2 and self.lr_multiplier > 0.1:
-            self.lr_multiplier /= 1.5
+        if kl > self.kl_targ * 2 and self.lr_multiplier > 1.0:
+            self.lr_multiplier = max(1.0, self.lr_multiplier / 1.5)
         elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
             self.lr_multiplier *= 1.5
 
@@ -172,7 +174,7 @@ class TrainPipeline():
                 self.collect_selfplay_data(self.play_batch_size)
                 print("batch i:{}, episode_len:{}".format(
                         i+1, self.episode_len))
-                if len(self.data_buffer) > self.batch_size:
+                if len(self.data_buffer) > 5000:
                     loss, entropy = self.policy_update()
                 if (i+1) % self.check_freq == 0:
                     print("current self-play batch: {}".format(i+1))

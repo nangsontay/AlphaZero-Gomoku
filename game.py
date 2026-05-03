@@ -176,16 +176,29 @@ class Game(object):
                         print("Game end. Tie")
                 return winner
 
-    def start_self_play(self, player, is_shown=0, temp=1e-3):
+    def start_self_play(self, player, is_shown=0, temp=None,
+                        temp_schedule=None):
         """ start a self-play game using a MCTS player, reuse the search tree,
         and store the self-play data: (state, mcts_probs, z) for training
         """
+        if temp_schedule is None:
+            temp_schedule = ((30, 1.0), (float("inf"), 1e-3))
+
+        def temperature_for_move(move_idx):
+            if temp is not None:
+                return temp
+            for max_move, move_temp in temp_schedule:
+                if move_idx < max_move:
+                    return move_temp
+            return temp_schedule[-1][1]
+
         self.board.init_board()
         p1, p2 = self.board.players
         states, mcts_probs, current_players = [], [], []
         while True:
+            move_idx = len(states)
             move, move_probs = player.get_action(self.board,
-                                                 temp=temp,
+                                                 temp=temperature_for_move(move_idx),
                                                  return_prob=1)
             # store the data
             states.append(self.board.current_state())

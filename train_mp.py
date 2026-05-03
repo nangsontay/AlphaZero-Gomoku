@@ -99,7 +99,9 @@ def selfplay_worker(args):
         n_in_row = int(args["n_in_row"])
         n_playout = int(args["n_playout"])
         c_puct = float(args["c_puct"])
-        temp = float(args["temp"])
+        temp = args.get("temp")
+        temp = None if temp is None else float(temp)
+        temp_schedule = args.get("temp_schedule")
         n_games = int(args["n_games"])
         model_file = args["model_file"]
 
@@ -137,7 +139,11 @@ def selfplay_worker(args):
 
         for game_idx in range(n_games):
             game_start = time.time()
-            winner, play_data = game.start_self_play(mcts_player, temp=temp)
+            winner, play_data = game.start_self_play(
+                mcts_player,
+                temp=temp,
+                temp_schedule=temp_schedule
+            )
             play_data = list(play_data)
             episode_lens.append(len(play_data))
             all_data.extend(get_equi_data(play_data, board_width, board_height))
@@ -235,15 +241,17 @@ class TrainPipeline(object):
 
         self.learn_rate = 2e-3
         self.lr_multiplier = 1.0
-        self.temp = 1.0
+        self.temp = None
+        self.temp_schedule = ((30, 1.0), (float("inf"), 1e-3))
         self.n_playout = int(n_playout)
         self.c_puct = 5
-        self.buffer_size = 10000
+        self.buffer_size = 100000
         self.batch_size = int(batch_size)
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = self.num_workers * self.games_per_worker
+        self.updates_per_cycle = max(1, self.play_batch_size)
 
-        self.epochs = 5
+        self.epochs = 1
         self.kl_targ = 0.02
         self.check_freq = int(check_freq)
         self.game_batch_num = int(game_batch_num)
@@ -296,6 +304,7 @@ class TrainPipeline(object):
                 "n_playout": self.n_playout,
                 "c_puct": self.c_puct,
                 "temp": self.temp,
+                "temp_schedule": self.temp_schedule,
                 "threads_per_worker": self.threads_per_worker,
             }
             for worker_id in range(self.num_workers)
@@ -396,8 +405,8 @@ class TrainPipeline(object):
             if kl > self.kl_targ * 4:
                 break
 
-        if kl > self.kl_targ * 2 and self.lr_multiplier > 0.1:
-            self.lr_multiplier /= 1.5
+        if kl > self.kl_targ * 2 and self.lr_multiplier > 1.0:
+            self.lr_multiplier = max(1.0, self.lr_multiplier / 1.5)
         elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
             self.lr_multiplier *= 1.5
 
@@ -492,8 +501,12 @@ class TrainPipeline(object):
                     len(self.data_buffer)
                 ), flush=True)
 
-                if len(self.data_buffer) > self.batch_size:
-                    self.policy_update()
+                if len(self.data_buffer) > 5000:
+                    for update_idx in range(self.updates_per_cycle):
+                        self.policy_update()
+                    print("policy updates this cycle: {}".format(
+                        self.updates_per_cycle
+                    ), flush=True)
                     self.policy_value_net.save_model("./current_policy.model")
 
                 if (i + 1) % self.check_freq == 0:

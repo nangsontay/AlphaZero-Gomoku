@@ -86,7 +86,8 @@ class TreeNode(object):
 class MCTS(object):
     """An implementation of Monte Carlo Tree Search."""
 
-    def __init__(self, policy_value_fn, c_puct=5, n_playout=10000):
+    def __init__(self, policy_value_fn, c_puct=5, n_playout=10000,
+                 dirichlet_alpha=0.05, dirichlet_epsilon=0.25):
         """
         policy_value_fn: a function that takes in a board state and outputs
             a list of (action, probability) tuples and also a score in [-1, 1]
@@ -100,6 +101,8 @@ class MCTS(object):
         self._policy = policy_value_fn
         self._c_puct = c_puct
         self._n_playout = n_playout
+        self._dirichlet_alpha = dirichlet_alpha
+        self._dirichlet_epsilon = dirichlet_epsilon
 
     def _playout(self, state):
         """Run a single playout from the root to the leaf, getting a value at
@@ -134,12 +137,33 @@ class MCTS(object):
         # Update value and visit count of nodes in this traversal.
         node.update_recursive(-leaf_value)
 
-    def get_move_probs(self, state, temp=1e-3):
+    def _add_dirichlet_noise_to_root(self, state):
+        """Mix Dirichlet noise into root child priors before playouts."""
+        if self._root.is_leaf():
+            action_probs, _ = self._policy(state)
+            self._root.expand(action_probs)
+
+        if not self._root._children:
+            return
+
+        acts = list(self._root._children.keys())
+        noise = np.random.dirichlet(
+            self._dirichlet_alpha * np.ones(len(acts))
+        )
+        for act, noise_prob in zip(acts, noise):
+            child = self._root._children[act]
+            child._P = ((1.0 - self._dirichlet_epsilon) * child._P +
+                        self._dirichlet_epsilon * noise_prob)
+
+    def get_move_probs(self, state, temp=1e-3, add_noise=False):
         """Run all playouts sequentially and return the available actions and
         their corresponding probabilities.
         state: the current game state
         temp: temperature parameter in (0, 1] controls the level of exploration
         """
+        if add_noise:
+            self._add_dirichlet_noise_to_root(state)
+
         for n in range(self._n_playout):
             state_copy = copy.deepcopy(state)
             self._playout(state_copy)
@@ -185,15 +209,14 @@ class MCTSPlayer(object):
         # the pi vector returned by MCTS as in the alphaGo Zero paper
         move_probs = np.zeros(board.width*board.height)
         if len(sensible_moves) > 0:
-            acts, probs = self.mcts.get_move_probs(board, temp)
+            acts, probs = self.mcts.get_move_probs(
+                board,
+                temp,
+                add_noise=bool(self._is_selfplay)
+            )
             move_probs[list(acts)] = probs
             if self._is_selfplay:
-                # add Dirichlet Noise for exploration (needed for
-                # self-play training)
-                move = np.random.choice(
-                    acts,
-                    p=0.75*probs + 0.25*np.random.dirichlet(0.3*np.ones(len(probs)))
-                )
+                move = np.random.choice(acts, p=probs)
                 # update the root node and reuse the search tree
                 self.mcts.update_with_move(move)
             else:

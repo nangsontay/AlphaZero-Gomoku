@@ -238,7 +238,9 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
         n_games = int(args["n_games"])
         n_playout = int(args["n_playout"])
         c_puct = float(args["c_puct"])
-        temp = float(args["temp"])
+        temp = args.get("temp")
+        temp = None if temp is None else float(temp)
+        temp_schedule = args.get("temp_schedule")
 
         print("[worker {}] start: games={}, n_playout={}, pid={}".format(
             wid, n_games, n_playout, os.getpid()), flush=True)
@@ -262,7 +264,11 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
         start = time.time()
         for game_idx in range(n_games):
             t0 = time.time()
-            winner, play_data = game.start_self_play(mcts_player, temp=temp)
+            winner, play_data = game.start_self_play(
+                mcts_player,
+                temp=temp,
+                temp_schedule=temp_schedule
+            )
             play_data = list(play_data)
             episode_lens.append(len(play_data))
             all_data.extend(get_equi_data(play_data, bw, bh))
@@ -323,13 +329,16 @@ class TrainPipeline(object):
         self.game = Game(self.board)
         self.learn_rate = 2e-3
         self.lr_multiplier = 1.0
-        self.temp = 1.0
+        self.temp = None
+        self.temp_schedule = ((30, 1.0), (float("inf"), 1e-3))
         self.n_playout = int(n_playout)
         self.c_puct = 5
-        self.buffer_size = 50000
+        self.buffer_size = 200000
         self.batch_size = int(batch_size)
         self.data_buffer = deque(maxlen=self.buffer_size)
-        self.epochs = 5
+        self.play_batch_size = self.num_workers * self.games_per_worker
+        self.updates_per_cycle = max(1, self.play_batch_size)
+        self.epochs = 1
         self.kl_targ = 0.02
         self.check_freq = int(check_freq)
         self.game_batch_num = int(game_batch_num)
@@ -362,6 +371,7 @@ class TrainPipeline(object):
                 "n_playout": self.n_playout,
                 "c_puct": self.c_puct,
                 "temp": self.temp,
+                "temp_schedule": self.temp_schedule,
                 "threads_per_worker": self.threads_per_worker,
                 "response_timeout": self.response_timeout,
                 "worker_log_every": 2000,
@@ -513,8 +523,8 @@ class TrainPipeline(object):
             if kl > self.kl_targ * 4:
                 break
 
-        if kl > self.kl_targ * 2 and self.lr_multiplier > 0.1:
-            self.lr_multiplier /= 1.5
+        if kl > self.kl_targ * 2 and self.lr_multiplier > 1.0:
+            self.lr_multiplier = max(1.0, self.lr_multiplier / 1.5)
         elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
             self.lr_multiplier *= 1.5
 
@@ -555,8 +565,12 @@ class TrainPipeline(object):
                 self.collect_selfplay_data_remote_gpu()
                 print("batch i:{}, data_buffer:{}".format(
                     i + 1, len(self.data_buffer)), flush=True)
-                if len(self.data_buffer) > self.batch_size:
-                    self.policy_update()
+                if len(self.data_buffer) > 5000:
+                    for update_idx in range(self.updates_per_cycle):
+                        self.policy_update()
+                    print("policy updates this cycle: {}".format(
+                        self.updates_per_cycle
+                    ), flush=True)
                     self.policy_value_net.save_model("./current_policy.model")
                 if (i + 1) % self.check_freq == 0:
                     print("current self-play batch: {}".format(i + 1), flush=True)
