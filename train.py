@@ -39,13 +39,21 @@ class TrainPipeline():
         self.board = Board(width=self.board_width,
                            height=self.board_height,
                            n_in_row=self.n_in_row)
-        self.game = Game(self.board) 
-        self.learn_rate = 2e-3
-        self.lr_multiplier = 1.0
+        self.game = Game(self.board)
+        # Hybrid LR scheduler state.
+        self.global_update_count = 0
+        self.lr_safety_multiplier = 1.0  # one-way KL safety brake, in [0.1, 1.0]
+        self.lr_safety_min = 0.1
+        self.lr_safety_max = 1.0
+        self.lr_schedule = [
+            (5000, 2e-3),
+            (20000, 2e-4),
+            (float("inf"), 2e-5),
+        ]
         self.temp = 1.0
         self.n_playout = 400
         self.c_puct = 5
-        self.buffer_size = 10000
+        self.buffer_size = 500000
         self.batch_size = 512
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
@@ -98,19 +106,33 @@ class TrainPipeline():
             play_data = self.get_equi_data(play_data)
             self.data_buffer.extend(play_data)
 
+    def _get_base_lr(self):
+        """Return base LR from fixed step schedule keyed on global_update_count."""
+        n = self.global_update_count
+        for threshold, lr in self.lr_schedule:
+            if n < threshold:
+                return float(lr)
+        return float(self.lr_schedule[-1][1])
+
     def policy_update(self):
         """update the policy-value net"""
         mini_batch = random.sample(self.data_buffer, self.batch_size)
         state_batch = [data[0] for data in mini_batch]
         mcts_probs_batch = [data[1] for data in mini_batch]
         winner_batch = [data[2] for data in mini_batch]
+        base_lr = self._get_base_lr()
+        effective_lr = base_lr * self.lr_safety_multiplier
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
+        kl = 0.0
+        loss = 0.0
+        entropy = 0.0
+        new_v = old_v
         for i in range(self.epochs):
             loss, entropy = self.policy_value_net.train_step(
                     state_batch,
                     mcts_probs_batch,
                     winner_batch,
-                    self.learn_rate*self.lr_multiplier)
+                    effective_lr)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                     np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)),
@@ -118,10 +140,8 @@ class TrainPipeline():
             )
             if kl > self.kl_targ * 4:
                 break
-        if kl > self.kl_targ * 2 and self.lr_multiplier > 0.1:
-            self.lr_multiplier /= 1.5
-        elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
-            self.lr_multiplier *= 1.5
+
+        self.global_update_count += 1
 
         explained_var_old = (1 -
                              np.var(np.array(winner_batch) - old_v.flatten()) /
@@ -130,18 +150,20 @@ class TrainPipeline():
                              np.var(np.array(winner_batch) - new_v.flatten()) /
                              np.var(np.array(winner_batch)))
         print(("kl:{:.5f},"
-               "lr_multiplier:{:.3f},"
+               "base_lr:{:.2e},"
+               "safety:{:.3f},"
                "loss:{},"
                "entropy:{},"
                "explained_var_old:{:.3f},"
                "explained_var_new:{:.3f}"
                ).format(kl,
-                        self.lr_multiplier,
+                        base_lr,
+                        self.lr_safety_multiplier,
                         loss,
                         entropy,
                         explained_var_old,
-                        explained_var_new))
-        return loss, entropy
+                        explained_var_new), flush=True)
+        return loss, entropy, kl
 
     def policy_evaluate(self, n_games=10):
         """
@@ -172,8 +194,30 @@ class TrainPipeline():
                 self.collect_selfplay_data(self.play_batch_size)
                 print("batch i:{}, episode_len:{}".format(
                         i+1, self.episode_len))
-                if len(self.data_buffer) > self.batch_size:
-                    loss, entropy = self.policy_update()
+                if len(self.data_buffer) > 5000:
+                    cycle_kls = []
+                    loss, entropy, kl = self.policy_update()
+                    cycle_kls.append(float(kl))
+
+                    median_kl = float(np.median(cycle_kls)) if cycle_kls else 0.0
+                    if (median_kl > self.kl_targ * 4 and
+                            self.lr_safety_multiplier > self.lr_safety_min):
+                        self.lr_safety_multiplier = max(
+                            self.lr_safety_min,
+                            self.lr_safety_multiplier / 1.5)
+                    elif (median_kl < self.kl_targ and
+                          self.lr_safety_multiplier < self.lr_safety_max):
+                        self.lr_safety_multiplier = min(
+                            self.lr_safety_max,
+                            self.lr_safety_multiplier * 1.2)
+
+                    print("cycle median_kl: {:.5f}, lr_safety_multiplier: {:.3f}, "
+                          "global_update_count: {}, base_lr: {:.2e}".format(
+                              median_kl, self.lr_safety_multiplier,
+                              self.global_update_count, self._get_base_lr()),
+                          flush=True)
+
+                    print("policy updates this cycle: 1", flush=True)
                 if (i+1) % self.check_freq == 0:
                     print("current self-play batch: {}".format(i+1))
                     win_ratio = self.policy_evaluate()

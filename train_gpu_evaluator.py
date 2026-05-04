@@ -15,7 +15,7 @@ import queue
 import random
 import time
 import traceback
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -259,22 +259,29 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
 
         all_data = []
         episode_lens = []
+        winner_counts = Counter()
         start = time.time()
         for game_idx in range(n_games):
             t0 = time.time()
             winner, play_data = game.start_self_play(mcts_player, temp=temp)
+            winner_counts[winner] += 1
             play_data = list(play_data)
             episode_lens.append(len(play_data))
             all_data.extend(get_equi_data(play_data, bw, bh))
-            print("[worker {}] game {}/{} done: winner={}, episode_len={}, eval_requests={}, {:.1f}s".format(
-                wid, game_idx + 1, n_games, winner, len(play_data),
-                client.request_id, time.time() - t0), flush=True)
+            print("[worker {}] game {}/{} done: winner={}, winner_counts={}, episode_len={}, eval_requests={}, {:.1f}s".format(
+                wid, game_idx + 1, n_games, winner, dict(winner_counts),
+                len(play_data), client.request_id, time.time() - t0), flush=True)
+
+        print("[worker {}] batch done: winner_counts={}, games={}, eval_requests={}, elapsed={:.1f}s".format(
+            wid, dict(winner_counts), n_games, client.request_id,
+            time.time() - start), flush=True)
 
         output_queue.put({
             "ok": True,
             "worker_id": wid,
             "data": all_data,
             "episode_lens": episode_lens,
+            "winner_counts": dict(winner_counts),
             "eval_requests": client.request_id,
             "elapsed": time.time() - start,
         })
@@ -288,6 +295,7 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
             "traceback": tb,
             "data": [],
             "episode_lens": [],
+            "winner_counts": {},
             "eval_requests": 0,
             "elapsed": 0.0,
         })
@@ -321,14 +329,23 @@ class TrainPipeline(object):
         self.board = Board(width=self.board_width, height=self.board_height,
                            n_in_row=self.n_in_row)
         self.game = Game(self.board)
-        self.learn_rate = 2e-3
-        self.lr_multiplier = 1.0
+        # Hybrid LR scheduler state.
+        self.global_update_count = 0
+        self.lr_safety_multiplier = 1.0  # one-way KL safety brake, in [0.1, 1.0]
+        self.lr_safety_min = 0.1
+        self.lr_safety_max = 1.0
+        self.lr_schedule = [
+            (5000, 2e-3),
+            (20000, 2e-4),
+            (float("inf"), 2e-5),
+        ]
         self.temp = 1.0
         self.n_playout = int(n_playout)
         self.c_puct = 5
-        self.buffer_size = 50000
+        self.buffer_size = 500000
         self.batch_size = int(batch_size)
         self.data_buffer = deque(maxlen=self.buffer_size)
+        self.updates_per_cycle = self.num_workers * self.games_per_worker
         self.epochs = 5
         self.kl_targ = 0.02
         self.check_freq = int(check_freq)
@@ -430,9 +447,10 @@ class TrainPipeline(object):
                     raise RuntimeError("worker {} failed: {}\n{}".format(
                         result.get("worker_id"), result.get("error"),
                         result.get("traceback")))
-                print("self-play progress: {}/{} worker(s), worker={}, games={}, eval_requests={}, elapsed={:.1f}s".format(
+                print("self-play progress: {}/{} worker(s), worker={}, games={}, winner_counts={}, eval_requests={}, elapsed={:.1f}s".format(
                     completed, self.num_workers, result.get("worker_id"),
                     len(result.get("episode_lens", [])),
+                    result.get("winner_counts", {}),
                     result.get("eval_requests", 0),
                     float(result.get("elapsed", 0.0))), flush=True)
 
@@ -492,11 +510,21 @@ class TrainPipeline(object):
             max(worker_times) if worker_times else 0.0, len(self.data_buffer)),
             flush=True)
 
+    def _get_base_lr(self):
+        """Return base LR from fixed step schedule keyed on global_update_count."""
+        n = self.global_update_count
+        for threshold, lr in self.lr_schedule:
+            if n < threshold:
+                return float(lr)
+        return float(self.lr_schedule[-1][1])
+
     def policy_update(self):
         mini_batch = random.sample(self.data_buffer, self.batch_size)
         state_batch = [d[0] for d in mini_batch]
         mcts_probs_batch = [d[1] for d in mini_batch]
         winner_batch = [d[2] for d in mini_batch]
+        base_lr = self._get_base_lr()
+        effective_lr = base_lr * self.lr_safety_multiplier
 
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
         kl = 0.0
@@ -506,29 +534,34 @@ class TrainPipeline(object):
         for _ in range(self.epochs):
             loss, entropy = self.policy_value_net.train_step(
                 state_batch, mcts_probs_batch, winner_batch,
-                self.learn_rate * self.lr_multiplier)
+                effective_lr)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                 np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)), axis=1))
             if kl > self.kl_targ * 4:
                 break
 
-        if kl > self.kl_targ * 2 and self.lr_multiplier > 0.1:
-            self.lr_multiplier /= 1.5
-        elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
-            self.lr_multiplier *= 1.5
+        self.global_update_count += 1
 
         winner_np = np.array(winner_batch)
         winner_var = np.var(winner_np)
+        n_pos = int((winner_np > 0).sum())
+        n_neg = int((winner_np < 0).sum())
+        n_zero = int((winner_np == 0).sum())
+        old_v_flat = old_v.flatten()
+        new_v_flat = new_v.flatten()
         if winner_var > 1e-12:
-            ev_old = 1 - np.var(winner_np - old_v.flatten()) / winner_var
-            ev_new = 1 - np.var(winner_np - new_v.flatten()) / winner_var
+            ev_old = 1 - float(np.var(winner_np - old_v_flat) / winner_var)
+            ev_new = 1 - float(np.var(winner_np - new_v_flat) / winner_var)
         else:
             ev_old = 0.0
             ev_new = 0.0
-        print("kl:{:.5f},lr_multiplier:{:.3f},loss:{},entropy:{},explained_var_old:{:.3f},explained_var_new:{:.3f}".format(
-            kl, self.lr_multiplier, loss, entropy, ev_old, ev_new), flush=True)
-        return loss, entropy
+        print(f"z_dist: pos={n_pos}, neg={n_neg}, zero={n_zero}, winner_var={winner_var:.6f} | "
+              f"v_old: mean={old_v_flat.mean():.4f} std={old_v_flat.std():.4f} | v_new: mean={new_v_flat.mean():.4f} std={new_v_flat.std():.4f} | "
+              f"ev_old={ev_old:.6f} ev_new={ev_new:.6f}", flush=True)
+        print("kl:{:.5f},base_lr:{:.2e},safety:{:.3f},loss:{},entropy:{},ev_old:{:.3f},ev_new:{:.3f}".format(
+            kl, base_lr, self.lr_safety_multiplier, loss, entropy, ev_old, ev_new), flush=True)
+        return loss, entropy, kl
 
     def policy_evaluate(self, n_games=None):
         if n_games is None:
@@ -555,8 +588,32 @@ class TrainPipeline(object):
                 self.collect_selfplay_data_remote_gpu()
                 print("batch i:{}, data_buffer:{}".format(
                     i + 1, len(self.data_buffer)), flush=True)
-                if len(self.data_buffer) > self.batch_size:
-                    self.policy_update()
+                if len(self.data_buffer) > 5000:
+                    cycle_kls = []
+                    for _ in range(self.updates_per_cycle):
+                        loss, entropy, kl = self.policy_update()
+                        cycle_kls.append(float(kl))
+
+                    median_kl = float(np.median(cycle_kls)) if cycle_kls else 0.0
+                    if (median_kl > self.kl_targ * 4 and
+                            self.lr_safety_multiplier > self.lr_safety_min):
+                        self.lr_safety_multiplier = max(
+                            self.lr_safety_min,
+                            self.lr_safety_multiplier / 1.5)
+                    elif (median_kl < self.kl_targ and
+                          self.lr_safety_multiplier < self.lr_safety_max):
+                        self.lr_safety_multiplier = min(
+                            self.lr_safety_max,
+                            self.lr_safety_multiplier * 1.2)
+
+                    print("cycle median_kl: {:.5f}, lr_safety_multiplier: {:.3f}, "
+                          "global_update_count: {}, base_lr: {:.2e}".format(
+                              median_kl, self.lr_safety_multiplier,
+                              self.global_update_count, self._get_base_lr()),
+                          flush=True)
+
+                    print("policy updates this cycle: {}".format(
+                        self.updates_per_cycle), flush=True)
                     self.policy_value_net.save_model("./current_policy.model")
                 if (i + 1) % self.check_freq == 0:
                     print("current self-play batch: {}".format(i + 1), flush=True)

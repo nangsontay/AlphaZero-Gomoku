@@ -176,16 +176,19 @@ class Game(object):
                         print("Game end. Tie")
                 return winner
 
-    def start_self_play(self, player, is_shown=0, temp=1e-3):
+    def start_self_play(self, player, is_shown=0, temp=1e-3,
+                        temp_threshold=15):
         """ start a self-play game using a MCTS player, reuse the search tree,
         and store the self-play data: (state, mcts_probs, z) for training
         """
         self.board.init_board()
         p1, p2 = self.board.players
         states, mcts_probs, current_players = [], [], []
+        move_count = 0
         while True:
+            cur_temp = temp if move_count < temp_threshold else 1e-3
             move, move_probs = player.get_action(self.board,
-                                                 temp=temp,
+                                                 temp=cur_temp,
                                                  return_prob=1)
             # store the data
             states.append(self.board.current_state())
@@ -193,6 +196,7 @@ class Game(object):
             current_players.append(self.board.current_player)
             # perform a move
             self.board.do_move(move)
+            move_count += 1
             if is_shown:
                 self.graphic(self.board, p1, p2)
             end, winner = self.board.game_end()
