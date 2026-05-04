@@ -9,6 +9,7 @@ all workers and calls PolicyValueNet.policy_value(batch).
 from __future__ import print_function
 
 import argparse
+import json
 import multiprocessing as mp
 import os
 import queue
@@ -305,7 +306,8 @@ class TrainPipeline(object):
                  response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
                  dirichlet_alpha=0.03, noise_eps=0.25,
                  buffer_size=500000, recent_sample_window=200000,
-                 worker_model_file="./_tmp_gpu_evaluator_policy.model"):
+                 worker_model_file="./_tmp_gpu_evaluator_policy.model",
+                 batch_log_file="training_batches.log"):
         self.use_gpu = bool(use_gpu)
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
@@ -320,6 +322,8 @@ class TrainPipeline(object):
         self.eval_timeout_ms = max(1, int(eval_timeout_ms))
         self.response_timeout = float(response_timeout)
         self.worker_model_file = worker_model_file
+        self.batch_log_file = batch_log_file
+        self.last_update_metrics = None
 
         self.board_width = 15
         self.board_height = 15
@@ -549,18 +553,57 @@ class TrainPipeline(object):
 
         winner_np = np.array(winner_batch)
         winner_var = np.var(winner_np)
+        n_pos = int((winner_np > 0).sum())
+        n_neg = int((winner_np < 0).sum())
+        n_zero = int((winner_np == 0).sum())
+        old_v_flat = old_v.flatten()
+        new_v_flat = new_v.flatten()
         if winner_var > 1e-12:
-            ev_old = 1 - np.var(winner_np - old_v.flatten()) / winner_var
-            ev_new = 1 - np.var(winner_np - new_v.flatten()) / winner_var
+            ev_old = 1 - np.var(winner_np - old_v_flat) / winner_var
+            ev_new = 1 - np.var(winner_np - new_v_flat) / winner_var
         else:
             ev_old = 0.0
             ev_new = 0.0
         self.global_update_count += 1
+        print(f"z_dist: pos={n_pos}, neg={n_neg}, zero={n_zero}, winner_var={winner_var:.6f} | "
+              f"v_old: mean={old_v_flat.mean():.4f} std={old_v_flat.std():.4f} | "
+              f"v_new: mean={new_v_flat.mean():.4f} std={new_v_flat.std():.4f} | "
+              f"ev_old={ev_old:.6f} ev_new={ev_new:.6f}", flush=True)
+        effective_lr = self.learn_rate * self.lr_multiplier
         print("update:{},base_lr:{:.6g},effective_lr:{:.6g},sample_window:{},kl:{:.5f},lr_multiplier:{:.3f},loss:{},entropy:{},explained_var_old:{:.3f},explained_var_new:{:.3f}".format(
             self.global_update_count, self.learn_rate,
-            self.learn_rate * self.lr_multiplier, sample_window,
+            effective_lr, sample_window,
             kl, self.lr_multiplier, loss, entropy, ev_old, ev_new), flush=True)
+        self.last_update_metrics = {
+            "update": self.global_update_count,
+            "base_lr": float(self.learn_rate),
+            "effective_lr": float(effective_lr),
+            "sample_window": int(sample_window),
+            "kl": float(kl),
+            "lr_multiplier": float(self.lr_multiplier),
+            "loss": float(loss),
+            "entropy": float(entropy),
+            "explained_var_old": float(ev_old),
+            "explained_var_new": float(ev_new),
+            "z_pos": int(n_pos),
+            "z_neg": int(n_neg),
+            "z_zero": int(n_zero),
+            "winner_var": float(winner_var),
+            "v_old_mean": float(old_v_flat.mean()),
+            "v_old_std": float(old_v_flat.std()),
+            "v_new_mean": float(new_v_flat.mean()),
+            "v_new_std": float(new_v_flat.std()),
+        }
         return loss, entropy
+
+    def append_batch_log(self, batch_result):
+        if not self.batch_log_file:
+            return
+        log_dir = os.path.dirname(os.path.abspath(self.batch_log_file))
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(self.batch_log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(batch_result, sort_keys=True) + "\n")
 
     def policy_evaluate(self, n_games=None):
         if n_games is None:
@@ -586,13 +629,24 @@ class TrainPipeline(object):
         try:
             for i in range(self.game_batch_num):
                 self.collect_selfplay_data_remote_gpu()
+                batch_no = i + 1
                 print("batch i:{}, data_buffer:{}".format(
-                    i + 1, len(self.data_buffer)), flush=True)
+                    batch_no, len(self.data_buffer)), flush=True)
+                update_metrics = None
                 if len(self.data_buffer) > self.batch_size:
                     self.policy_update()
+                    update_metrics = self.last_update_metrics
                     self.policy_value_net.save_model("./current_policy.model")
-                if (i + 1) % self.check_freq == 0:
-                    print("current self-play batch: {}".format(i + 1), flush=True)
+                self.append_batch_log({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "batch": int(batch_no),
+                    "data_buffer": int(len(self.data_buffer)),
+                    "episode_len": float(getattr(self, "episode_len", 0.0)),
+                    "updated": update_metrics is not None,
+                    "update_metrics": update_metrics,
+                })
+                if batch_no % self.check_freq == 0:
+                    print("current self-play batch: {}".format(batch_no), flush=True)
                     win_ratio = self.policy_evaluate(self.eval_games)
                     self.policy_value_net.save_model("./current_policy.model")
                     if win_ratio > self.best_win_ratio:
@@ -631,6 +685,8 @@ def parse_args():
     p.add_argument("--eval-batch-size", type=int, default=128)
     p.add_argument("--eval-timeout-ms", type=int, default=8)
     p.add_argument("--response-timeout", type=float, default=180.0)
+    p.add_argument("--batch-log-file", default="training_batches.log",
+                   help="Path to append one JSON training summary per game batch. Use an empty string to disable.")
     return p.parse_args()
 
 
@@ -660,5 +716,6 @@ if __name__ == "__main__":
         eval_batch_size=args.eval_batch_size,
         eval_timeout_ms=args.eval_timeout_ms,
         response_timeout=args.response_timeout,
+        batch_log_file=args.batch_log_file,
     )
     pipeline.run()
