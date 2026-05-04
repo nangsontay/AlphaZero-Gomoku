@@ -133,7 +133,16 @@ class PolicyValueNet:
             weight_decay=self.l2_const,
             nesterov=True,
         )
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            try:
+                self.scaler = torch.amp.GradScaler(
+                    "cuda", enabled=self.use_amp
+                )
+            except TypeError:
+                self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
+        else:
+            legacy_grad_scaler = getattr(torch.cuda.amp, "GradScaler")
+            self.scaler = legacy_grad_scaler(enabled=self.use_amp)
 
         if model_file:
             net_params = torch.load(model_file, map_location=self.device)
@@ -153,7 +162,10 @@ class PolicyValueNet:
     def _autocast_context(self):
         if not self.use_amp:
             return nullcontext()
-        return torch.cuda.amp.autocast()
+        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            return torch.amp.autocast("cuda")
+        legacy_autocast = getattr(torch.cuda.amp, "autocast")
+        return legacy_autocast()
 
     def policy_value(self, state_batch):
         """
