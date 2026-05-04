@@ -86,7 +86,7 @@ class TreeNode(object):
 class MCTS(object):
     """An implementation of Monte Carlo Tree Search."""
 
-    def __init__(self, policy_value_fn, c_puct=5, n_playout=10000):
+    def __init__(self, policy_value_fn, c_puct=3.0, n_playout=10000):
         """
         policy_value_fn: a function that takes in a board state and outputs
             a list of (action, probability) tuples and also a score in [-1, 1]
@@ -170,9 +170,12 @@ class MCTSPlayer(object):
     """AI player based on MCTS"""
 
     def __init__(self, policy_value_function,
-                 c_puct=5, n_playout=2000, is_selfplay=0):
+                 c_puct=3.0, n_playout=2000, is_selfplay=0,
+                 dirichlet_alpha=0.03, noise_eps=0.25):
         self.mcts = MCTS(policy_value_function, c_puct, n_playout)
         self._is_selfplay = is_selfplay
+        self._dirichlet_alpha = float(dirichlet_alpha)
+        self._noise_eps = float(noise_eps)
 
     def set_player_ind(self, p):
         self.player = p
@@ -190,9 +193,12 @@ class MCTSPlayer(object):
             if self._is_selfplay:
                 # add Dirichlet Noise for exploration (needed for
                 # self-play training)
+                noise = np.random.dirichlet(
+                    self._dirichlet_alpha * np.ones(len(probs))
+                )
                 move = np.random.choice(
                     acts,
-                    p=0.75*probs + 0.25*np.random.dirichlet(0.3*np.ones(len(probs)))
+                    p=(1 - self._noise_eps) * probs + self._noise_eps * noise
                 )
                 # update the root node and reuse the search tree
                 self.mcts.update_with_move(move)

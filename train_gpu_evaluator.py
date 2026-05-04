@@ -239,6 +239,8 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
         n_playout = int(args["n_playout"])
         c_puct = float(args["c_puct"])
         temp = float(args["temp"])
+        dirichlet_alpha = float(args.get("dirichlet_alpha", 0.03))
+        noise_eps = float(args.get("noise_eps", 0.25))
 
         print("[worker {}] start: games={}, n_playout={}, pid={}".format(
             wid, n_games, n_playout, os.getpid()), flush=True)
@@ -255,7 +257,9 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
             log_every=int(args.get("worker_log_every", 2000)),
         )
         mcts_player = MCTSPlayer(client.policy_value_fn, c_puct=c_puct,
-                                 n_playout=n_playout, is_selfplay=1)
+                                 n_playout=n_playout, is_selfplay=1,
+                                 dirichlet_alpha=dirichlet_alpha,
+                                 noise_eps=noise_eps)
 
         all_data = []
         episode_lens = []
@@ -294,11 +298,13 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
 
 
 class TrainPipeline(object):
-    def __init__(self, init_model=None, use_gpu=True, num_workers=6,
-                 games_per_worker=1, threads_per_worker=1, n_playout=400,
+    def __init__(self, init_model=None, use_gpu=True, num_workers=10,
+                 games_per_worker=1, threads_per_worker=1, n_playout=800,
                  batch_size=512, game_batch_num=1500, check_freq=50,
-                 eval_games=10, eval_batch_size=64, eval_timeout_ms=5,
-                 response_timeout=180.0,
+                 eval_games=10, eval_batch_size=128, eval_timeout_ms=8,
+                 response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
+                 dirichlet_alpha=0.03, noise_eps=0.25,
+                 buffer_size=500000, recent_sample_window=200000,
                  worker_model_file="./_tmp_gpu_evaluator_policy.model"):
         self.use_gpu = bool(use_gpu)
         if self.use_gpu and not torch.cuda.is_available():
@@ -325,17 +331,28 @@ class TrainPipeline(object):
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.n_playout = int(n_playout)
-        self.c_puct = 5
-        self.buffer_size = 50000
+        self.eval_n_playout = int(eval_n_playout)
+        self.c_puct = float(c_puct)
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.noise_eps = float(noise_eps)
+        self.buffer_size = int(buffer_size)
+        self.recent_sample_window = max(1, int(recent_sample_window))
         self.batch_size = int(batch_size)
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.epochs = 5
         self.kl_targ = 0.02
+        self.global_update_count = 0
+        self.lr_schedule = [
+            (3000, 2e-3),
+            (15000, 5e-4),
+            (40000, 1e-4),
+            (float("inf"), 2e-5),
+        ]
         self.check_freq = int(check_freq)
         self.game_batch_num = int(game_batch_num)
         self.eval_games = int(eval_games)
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 1000
+        self.pure_mcts_playout_num = 2000
 
         self.policy_value_net = PolicyValueNet(
             self.board_width, self.board_height,
@@ -361,6 +378,8 @@ class TrainPipeline(object):
                 "n_in_row": self.n_in_row,
                 "n_playout": self.n_playout,
                 "c_puct": self.c_puct,
+                "dirichlet_alpha": self.dirichlet_alpha,
+                "noise_eps": self.noise_eps,
                 "temp": self.temp,
                 "threads_per_worker": self.threads_per_worker,
                 "response_timeout": self.response_timeout,
@@ -394,8 +413,9 @@ class TrainPipeline(object):
             name="gpu-evaluator")
 
         workers = []
-        print("remote-GPU self-play start: workers={}, games_per_worker={}, n_playout={}, eval_batch_size={}, eval_timeout_ms={}".format(
+        print("remote-GPU self-play start: workers={}, games_per_worker={}, n_playout={}, c_puct={}, dirichlet_alpha={}, noise_eps={}, eval_batch_size={}, eval_timeout_ms={}".format(
             self.num_workers, self.games_per_worker, self.n_playout,
+            self.c_puct, self.dirichlet_alpha, self.noise_eps,
             self.eval_batch_size, self.eval_timeout_ms), flush=True)
         evaluator.start()
 
@@ -492,12 +512,21 @@ class TrainPipeline(object):
             max(worker_times) if worker_times else 0.0, len(self.data_buffer)),
             flush=True)
 
+    def get_scheduled_lr(self):
+        for boundary, lr in self.lr_schedule:
+            if self.global_update_count < boundary:
+                return lr
+        return self.lr_schedule[-1][1]
+
     def policy_update(self):
-        mini_batch = random.sample(self.data_buffer, self.batch_size)
+        sample_window = min(len(self.data_buffer), self.recent_sample_window)
+        recent_buffer = list(self.data_buffer)[-sample_window:]
+        mini_batch = random.sample(recent_buffer, self.batch_size)
         state_batch = [d[0] for d in mini_batch]
         mcts_probs_batch = [d[1] for d in mini_batch]
         winner_batch = [d[2] for d in mini_batch]
 
+        self.learn_rate = self.get_scheduled_lr()
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
         kl = 0.0
         loss = 0.0
@@ -526,7 +555,10 @@ class TrainPipeline(object):
         else:
             ev_old = 0.0
             ev_new = 0.0
-        print("kl:{:.5f},lr_multiplier:{:.3f},loss:{},entropy:{},explained_var_old:{:.3f},explained_var_new:{:.3f}".format(
+        self.global_update_count += 1
+        print("update:{},base_lr:{:.6g},effective_lr:{:.6g},sample_window:{},kl:{:.5f},lr_multiplier:{:.3f},loss:{},entropy:{},explained_var_old:{:.3f},explained_var_new:{:.3f}".format(
+            self.global_update_count, self.learn_rate,
+            self.learn_rate * self.lr_multiplier, sample_window,
             kl, self.lr_multiplier, loss, entropy, ev_old, ev_new), flush=True)
         return loss, entropy
 
@@ -536,7 +568,8 @@ class TrainPipeline(object):
         if n_games <= 0:
             return self.best_win_ratio
         current = MCTSPlayer(self.policy_value_net.policy_value_fn,
-                             c_puct=self.c_puct, n_playout=self.n_playout)
+                             c_puct=self.c_puct,
+                             n_playout=self.eval_n_playout)
         pure = MCTS_Pure(c_puct=5, n_playout=self.pure_mcts_playout_num)
         win_cnt = defaultdict(int)
         for i in range(n_games):
@@ -581,16 +614,22 @@ def parse_args():
         description="Train AlphaZero Gomoku with central batched GPU evaluator")
     p.add_argument("--init-model", default=None)
     p.add_argument("--no-gpu", action="store_true")
-    p.add_argument("--num-workers", type=int, default=6)
+    p.add_argument("--num-workers", type=int, default=10)
     p.add_argument("--games-per-worker", type=int, default=1)
     p.add_argument("--threads-per-worker", type=int, default=1)
-    p.add_argument("--n-playout", type=int, default=400)
+    p.add_argument("--n-playout", type=int, default=800)
+    p.add_argument("--eval-n-playout", type=int, default=1600)
+    p.add_argument("--c-puct", type=float, default=3.0)
+    p.add_argument("--dirichlet-alpha", type=float, default=0.03)
+    p.add_argument("--noise-eps", type=float, default=0.25)
+    p.add_argument("--buffer-size", type=int, default=500000)
+    p.add_argument("--recent-sample-window", type=int, default=200000)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--game-batch-num", type=int, default=1500)
     p.add_argument("--check-freq", type=int, default=50)
     p.add_argument("--eval-games", type=int, default=10)
-    p.add_argument("--eval-batch-size", type=int, default=64)
-    p.add_argument("--eval-timeout-ms", type=int, default=5)
+    p.add_argument("--eval-batch-size", type=int, default=128)
+    p.add_argument("--eval-timeout-ms", type=int, default=8)
     p.add_argument("--response-timeout", type=float, default=180.0)
     return p.parse_args()
 
@@ -608,6 +647,12 @@ if __name__ == "__main__":
         games_per_worker=args.games_per_worker,
         threads_per_worker=args.threads_per_worker,
         n_playout=args.n_playout,
+        eval_n_playout=args.eval_n_playout,
+        c_puct=args.c_puct,
+        dirichlet_alpha=args.dirichlet_alpha,
+        noise_eps=args.noise_eps,
+        buffer_size=args.buffer_size,
+        recent_sample_window=args.recent_sample_window,
         batch_size=args.batch_size,
         game_batch_num=args.game_batch_num,
         check_freq=args.check_freq,

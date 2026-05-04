@@ -21,7 +21,10 @@ from policy_value_net_pytorch import PolicyValueNet  # Pytorch
 
 
 class TrainPipeline():
-    def __init__(self, init_model=None, use_gpu=True):
+    def __init__(self, init_model=None, use_gpu=True, n_playout=800,
+                 eval_n_playout=1600, c_puct=3.0,
+                 dirichlet_alpha=0.03, noise_eps=0.25,
+                 buffer_size=500000, recent_sample_window=200000):
         self.use_gpu = use_gpu
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError(
@@ -43,18 +46,29 @@ class TrainPipeline():
         self.learn_rate = 2e-3
         self.lr_multiplier = 1.0
         self.temp = 1.0
-        self.n_playout = 400
-        self.c_puct = 5
-        self.buffer_size = 10000
+        self.n_playout = int(n_playout)
+        self.eval_n_playout = int(eval_n_playout)
+        self.c_puct = float(c_puct)
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.noise_eps = float(noise_eps)
+        self.buffer_size = int(buffer_size)
+        self.recent_sample_window = max(1, int(recent_sample_window))
         self.batch_size = 512
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
         self.epochs = 5
         self.kl_targ = 0.02
+        self.global_update_count = 0
+        self.lr_schedule = [
+            (3000, 2e-3),
+            (15000, 5e-4),
+            (40000, 1e-4),
+            (float("inf"), 2e-5),
+        ]
         self.check_freq = 50
         self.game_batch_num = 1500
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 1000
+        self.pure_mcts_playout_num = 2000
         if init_model:
             self.policy_value_net = PolicyValueNet(self.board_width,
                                                    self.board_height,
@@ -67,7 +81,9 @@ class TrainPipeline():
         self.mcts_player = MCTSPlayer(self.policy_value_net.policy_value_fn,
                                       c_puct=self.c_puct,
                                       n_playout=self.n_playout,
-                                      is_selfplay=1)
+                                      is_selfplay=1,
+                                      dirichlet_alpha=self.dirichlet_alpha,
+                                      noise_eps=self.noise_eps)
 
     def get_equi_data(self, play_data):
         extend_data = []
@@ -98,12 +114,21 @@ class TrainPipeline():
             play_data = self.get_equi_data(play_data)
             self.data_buffer.extend(play_data)
 
+    def get_scheduled_lr(self):
+        for boundary, lr in self.lr_schedule:
+            if self.global_update_count < boundary:
+                return lr
+        return self.lr_schedule[-1][1]
+
     def policy_update(self):
         """update the policy-value net"""
-        mini_batch = random.sample(self.data_buffer, self.batch_size)
+        sample_window = min(len(self.data_buffer), self.recent_sample_window)
+        recent_buffer = list(self.data_buffer)[-sample_window:]
+        mini_batch = random.sample(recent_buffer, self.batch_size)
         state_batch = [data[0] for data in mini_batch]
         mcts_probs_batch = [data[1] for data in mini_batch]
         winner_batch = [data[2] for data in mini_batch]
+        self.learn_rate = self.get_scheduled_lr()
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
         for i in range(self.epochs):
             loss, entropy = self.policy_value_net.train_step(
@@ -123,19 +148,35 @@ class TrainPipeline():
         elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
             self.lr_multiplier *= 1.5
 
-        explained_var_old = (1 -
-                             np.var(np.array(winner_batch) - old_v.flatten()) /
-                             np.var(np.array(winner_batch)))
-        explained_var_new = (1 -
-                             np.var(np.array(winner_batch) - new_v.flatten()) /
-                             np.var(np.array(winner_batch)))
-        print(("kl:{:.5f},"
+        self.global_update_count += 1
+
+        winner_np = np.array(winner_batch)
+        winner_var = np.var(winner_np)
+        if winner_var > 1e-12:
+            explained_var_old = (1 -
+                                 np.var(winner_np - old_v.flatten()) /
+                                 winner_var)
+            explained_var_new = (1 -
+                                 np.var(winner_np - new_v.flatten()) /
+                                 winner_var)
+        else:
+            explained_var_old = 0.0
+            explained_var_new = 0.0
+        print(("update:{},"
+               "base_lr:{:.6g},"
+               "effective_lr:{:.6g},"
+               "sample_window:{},"
+               "kl:{:.5f},"
                "lr_multiplier:{:.3f},"
                "loss:{},"
                "entropy:{},"
                "explained_var_old:{:.3f},"
                "explained_var_new:{:.3f}"
-               ).format(kl,
+               ).format(self.global_update_count,
+                        self.learn_rate,
+                        self.learn_rate * self.lr_multiplier,
+                        sample_window,
+                        kl,
                         self.lr_multiplier,
                         loss,
                         entropy,
@@ -150,7 +191,7 @@ class TrainPipeline():
         """
         current_mcts_player = MCTSPlayer(self.policy_value_net.policy_value_fn,
                                          c_puct=self.c_puct,
-                                         n_playout=self.n_playout)
+                                         n_playout=self.eval_n_playout)
         pure_mcts_player = MCTS_Pure(c_puct=5,
                                      n_playout=self.pure_mcts_playout_num)
         win_cnt = defaultdict(int)
@@ -196,8 +237,22 @@ if __name__ == '__main__':
                         help='Path tới model checkpoint để train tiếp, nếu có')
     parser.add_argument('--no-gpu', action='store_true',
                         help='Chạy bằng CPU thay vì NVIDIA GPU')
+    parser.add_argument('--n-playout', type=int, default=800)
+    parser.add_argument('--eval-n-playout', type=int, default=1600)
+    parser.add_argument('--c-puct', type=float, default=3.0)
+    parser.add_argument('--dirichlet-alpha', type=float, default=0.03)
+    parser.add_argument('--noise-eps', type=float, default=0.25)
+    parser.add_argument('--buffer-size', type=int, default=500000)
+    parser.add_argument('--recent-sample-window', type=int, default=200000)
     args = parser.parse_args()
 
     training_pipeline = TrainPipeline(init_model=args.init_model,
-                                      use_gpu=not args.no_gpu)
+                                      use_gpu=not args.no_gpu,
+                                      n_playout=args.n_playout,
+                                      eval_n_playout=args.eval_n_playout,
+                                      c_puct=args.c_puct,
+                                      dirichlet_alpha=args.dirichlet_alpha,
+                                      noise_eps=args.noise_eps,
+                                      buffer_size=args.buffer_size,
+                                      recent_sample_window=args.recent_sample_window)
     training_pipeline.run()
