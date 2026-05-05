@@ -120,6 +120,63 @@ class RemotePolicyValueClient(object):
             value = float(resp["value"])
             return zip(legal_positions, act_probs[legal_positions]), value
 
+    def policy_value_batch_fn(self, states_np):
+        """Evaluate a batch of already-built board state tensors remotely.
+
+        states_np must be shaped (B, 4, board_width, board_height). Full-board
+        priors are returned so MCTS can slice them by each leaf's legal moves.
+        """
+        states_np = np.ascontiguousarray(states_np, dtype=np.float32)
+        if states_np.ndim != 4:
+            raise ValueError("states_np must have shape (B, C, H, W)")
+        batch_size = int(states_np.shape[0])
+        if batch_size == 0:
+            return (np.empty((0, self.board_width * self.board_height), dtype=np.float32),
+                    np.empty((0,), dtype=np.float32))
+
+        rids = []
+        for i in range(batch_size):
+            self.request_id += 1
+            rid = self.request_id
+            rids.append(rid)
+            if self.log_every > 0 and rid % self.log_every == 0:
+                print("[worker {}] eval requests sent: {}".format(
+                    self.worker_id, rid), flush=True)
+            self.request_queue.put({
+                "type": "eval",
+                "worker_id": self.worker_id,
+                "request_id": rid,
+                "state": np.ascontiguousarray(states_np[i]),
+            })
+
+        rid_to_idx = {rid: i for i, rid in enumerate(rids)}
+        priors_out = [None] * batch_size
+        values_out = np.empty(batch_size, dtype=np.float32)
+        received = 0
+        while received < batch_size:
+            try:
+                resp = self.response_queue.get(timeout=self.response_timeout)
+            except queue.Empty:
+                raise RuntimeError(
+                    "worker {} timed out waiting for GPU evaluator batch={} received={}".format(
+                        self.worker_id, batch_size, received
+                    )
+                )
+            if resp.get("type") == "error":
+                raise RuntimeError("GPU evaluator error: {}".format(
+                    resp.get("error")))
+            rid = resp.get("request_id")
+            if rid not in rid_to_idx:
+                continue
+            idx = rid_to_idx[rid]
+            if priors_out[idx] is not None:
+                continue
+            priors_out[idx] = np.asarray(resp["act_probs"], dtype=np.float32)
+            values_out[idx] = float(resp["value"])
+            received += 1
+
+        return np.stack(priors_out), values_out
+
 
 def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
                        response_queues, stats_queue, eval_batch_size=64,
@@ -247,9 +304,13 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
         temp_low = float(args.get("temp_low", 1e-3))
         dirichlet_alpha = float(args.get("dirichlet_alpha", 0.05))
         noise_eps = float(args.get("noise_eps", 0.25))
+        vl_k = int(args.get("vl_k", 4))
+        n_vl = float(args.get("n_vl", 1.0))
+        max_oversample = int(args.get("max_oversample", 3))
 
-        print("[worker {}] start: games={}, n_playout={}, pid={}".format(
-            wid, n_games, n_playout, os.getpid()), flush=True)
+        print("[worker {}] start: games={}, n_playout={}, vl_k={}, n_vl={}, max_oversample={}, pid={}".format(
+            wid, n_games, n_playout, vl_k, n_vl, max_oversample,
+            os.getpid()), flush=True)
 
         board = Board(width=bw, height=bh, n_in_row=int(args["n_in_row"]))
         game = Game(board)
@@ -262,10 +323,15 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
             response_timeout=float(args["response_timeout"]),
             log_every=int(args.get("worker_log_every", 2000)),
         )
-        mcts_player = MCTSPlayer(client.policy_value_fn, c_puct=c_puct,
+        mcts_player = MCTSPlayer(client.policy_value_fn,
+                                 client.policy_value_batch_fn,
+                                 c_puct=c_puct,
                                  n_playout=n_playout, is_selfplay=1,
                                  dirichlet_alpha=dirichlet_alpha,
-                                 noise_eps=noise_eps)
+                                 noise_eps=noise_eps,
+                                 vl_k=vl_k,
+                                 n_vl=n_vl,
+                                 max_oversample=max_oversample)
 
         all_data = []
         episode_lens = []
@@ -315,6 +381,7 @@ class TrainPipeline(object):
                  eval_games=10, eval_batch_size=128, eval_timeout_ms=8,
                  response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
                  dirichlet_alpha=0.05, noise_eps=0.25,
+                 vl_k=4, n_vl=1.0, max_oversample=3,
                  temperature_moves=8, temp_high=1.0, temp_low=1e-3,
                  buffer_size=500000, recent_sample_window=200000,
                  worker_model_file="./_tmp_gpu_evaluator_policy.model",
@@ -350,6 +417,9 @@ class TrainPipeline(object):
         self.c_puct = float(c_puct)
         self.dirichlet_alpha = float(dirichlet_alpha)
         self.noise_eps = float(noise_eps)
+        self.vl_k = max(1, int(vl_k))
+        self.n_vl = float(n_vl)
+        self.max_oversample = max(1, int(max_oversample))
         self.temperature_moves = int(temperature_moves) if temperature_moves is not None else None
         self.temp_high = float(temp_high)
         self.temp_low = float(temp_low)
@@ -398,6 +468,9 @@ class TrainPipeline(object):
                 "c_puct": self.c_puct,
                 "dirichlet_alpha": self.dirichlet_alpha,
                 "noise_eps": self.noise_eps,
+                "vl_k": self.vl_k,
+                "n_vl": self.n_vl,
+                "max_oversample": self.max_oversample,
                 "temperature_moves": self.temperature_moves,
                 "temp_high": self.temp_high,
                 "temp_low": self.temp_low,
@@ -434,9 +507,10 @@ class TrainPipeline(object):
             name="gpu-evaluator")
 
         workers = []
-        print("remote-GPU self-play start: workers={}, games_per_worker={}, n_playout={}, c_puct={}, dirichlet_alpha={}, noise_eps={}, temperature_moves={}, temp_high={}, temp_low={}, eval_batch_size={}, eval_timeout_ms={}".format(
+        print("remote-GPU self-play start: workers={}, games_per_worker={}, n_playout={}, c_puct={}, dirichlet_alpha={}, noise_eps={}, vl_k={}, n_vl={}, max_oversample={}, temperature_moves={}, temp_high={}, temp_low={}, eval_batch_size={}, eval_timeout_ms={}".format(
             self.num_workers, self.games_per_worker, self.n_playout,
             self.c_puct, self.dirichlet_alpha, self.noise_eps,
+            self.vl_k, self.n_vl, self.max_oversample,
             self.temperature_moves, self.temp_high, self.temp_low,
             self.eval_batch_size, self.eval_timeout_ms), flush=True)
         evaluator.start()
@@ -694,6 +768,12 @@ def parse_args():
     p.add_argument("--c-puct", type=float, default=3.0)
     p.add_argument("--dirichlet-alpha", type=float, default=0.05)
     p.add_argument("--noise-eps", type=float, default=0.25)
+    p.add_argument("--vl-k", type=int, default=4,
+                   help="Non-terminal leaves to collect per MCTS neural-net batch.")
+    p.add_argument("--n-vl", type=float, default=1.0,
+                   help="Virtual loss magnitude applied during leaf selection.")
+    p.add_argument("--max-oversample", type=int, default=3,
+                   help="Terminal oversampling cap multiplier for leaf collection.")
     p.add_argument("--temperature-moves", type=int, default=8)
     p.add_argument("--temp-high", type=float, default=1.0)
     p.add_argument("--temp-low", type=float, default=1e-3)
@@ -728,6 +808,9 @@ if __name__ == "__main__":
         c_puct=args.c_puct,
         dirichlet_alpha=args.dirichlet_alpha,
         noise_eps=args.noise_eps,
+        vl_k=args.vl_k,
+        n_vl=args.n_vl,
+        max_oversample=args.max_oversample,
         temperature_moves=args.temperature_moves,
         temp_high=args.temp_high,
         temp_low=args.temp_low,

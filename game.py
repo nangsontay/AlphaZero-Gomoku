@@ -33,6 +33,25 @@ class Board(object):
         self.states = {}
         self.last_move = -1
 
+    def copy_fast(self):
+        """Return a fast Board copy for MCTS simulations.
+
+        Rule constants are copied by reference/value, while the mutable move
+        tracking containers that do_move() mutates are cloned explicitly.
+        """
+        new = Board.__new__(Board)
+        new.width = self.width
+        new.height = self.height
+        new.n_in_row = self.n_in_row
+        new.players = self.players
+        new.states = dict(self.states)
+        new.availables = list(self.availables)
+        new._available_set = set(self._available_set)
+        new._available_pos = dict(self._available_pos)
+        new.current_player = self.current_player
+        new.last_move = self.last_move
+        return new
+
     def move_to_location(self, move):
         h = move // self.width
         w = move % self.width
