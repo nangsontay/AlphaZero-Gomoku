@@ -23,7 +23,8 @@ from policy_value_net_pytorch import PolicyValueNet  # Pytorch
 class TrainPipeline():
     def __init__(self, init_model=None, use_gpu=True, n_playout=800,
                  eval_n_playout=1600, c_puct=3.0,
-                 dirichlet_alpha=0.03, noise_eps=0.25,
+                 dirichlet_alpha=0.05, noise_eps=0.25,
+                 temperature_moves=8, temp_high=1.0, temp_low=1e-3,
                  buffer_size=500000, recent_sample_window=200000):
         self.use_gpu = use_gpu
         if self.use_gpu and not torch.cuda.is_available():
@@ -51,6 +52,9 @@ class TrainPipeline():
         self.c_puct = float(c_puct)
         self.dirichlet_alpha = float(dirichlet_alpha)
         self.noise_eps = float(noise_eps)
+        self.temperature_moves = int(temperature_moves) if temperature_moves is not None else None
+        self.temp_high = float(temp_high)
+        self.temp_low = float(temp_low)
         self.buffer_size = int(buffer_size)
         self.recent_sample_window = max(1, int(recent_sample_window))
         self.batch_size = 512
@@ -107,8 +111,12 @@ class TrainPipeline():
     def collect_selfplay_data(self, n_games=1):
         """collect self-play data for training"""
         for i in range(n_games):
-            winner, play_data = self.game.start_self_play(self.mcts_player,
-                                                          temp=self.temp)
+            winner, play_data = self.game.start_self_play(
+                self.mcts_player,
+                temp=self.temp,
+                temperature_moves=self.temperature_moves,
+                temp_high=self.temp_high,
+                temp_low=self.temp_low)
             play_data = list(play_data)[:]
             self.episode_len = len(play_data)
             play_data = self.get_equi_data(play_data)
@@ -240,8 +248,11 @@ if __name__ == '__main__':
     parser.add_argument('--n-playout', type=int, default=800)
     parser.add_argument('--eval-n-playout', type=int, default=1600)
     parser.add_argument('--c-puct', type=float, default=3.0)
-    parser.add_argument('--dirichlet-alpha', type=float, default=0.03)
+    parser.add_argument('--dirichlet-alpha', type=float, default=0.05)
     parser.add_argument('--noise-eps', type=float, default=0.25)
+    parser.add_argument('--temperature-moves', type=int, default=8)
+    parser.add_argument('--temp-high', type=float, default=1.0)
+    parser.add_argument('--temp-low', type=float, default=1e-3)
     parser.add_argument('--buffer-size', type=int, default=500000)
     parser.add_argument('--recent-sample-window', type=int, default=200000)
     args = parser.parse_args()
@@ -253,6 +264,9 @@ if __name__ == '__main__':
                                       c_puct=args.c_puct,
                                       dirichlet_alpha=args.dirichlet_alpha,
                                       noise_eps=args.noise_eps,
+                                      temperature_moves=args.temperature_moves,
+                                      temp_high=args.temp_high,
+                                      temp_low=args.temp_low,
                                       buffer_size=args.buffer_size,
                                       recent_sample_window=args.recent_sample_window)
     training_pipeline.run()

@@ -193,23 +193,35 @@ class Game(object):
                         print("Game end. Tie")
                 return winner
 
-    def start_self_play(self, player, is_shown=0, temp=1e-3):
+    def start_self_play(self, player, is_shown=0, temp=1e-3,
+                        temperature_moves=None, temp_high=1.0,
+                        temp_low=1e-3):
         """ start a self-play game using a MCTS player, reuse the search tree,
         and store the self-play data: (state, mcts_probs, z) for training
+
+        temp remains as the backward-compatible fixed-temperature path when
+        temperature_moves is None. Pass temperature_moves=0 to use temp_low
+        for the whole game, or a positive value to use temp_high for the first
+        temperature_moves plies and temp_low afterwards.
         """
         self.board.init_board()
         p1, p2 = self.board.players
         states, mcts_probs, current_players = [], [], []
+        move_idx = 0
         while True:
+            cur_temp = temp
+            if temperature_moves is not None:
+                cur_temp = temp_high if move_idx < temperature_moves else temp_low
             move, move_probs = player.get_action(self.board,
-                                                 temp=temp,
+                                                 temp=cur_temp,
                                                  return_prob=1)
             # store the data
-            states.append(self.board.current_state())
+            states.append(self.board.current_state().copy())
             mcts_probs.append(move_probs)
             current_players.append(self.board.current_player)
             # perform a move
             self.board.do_move(move)
+            move_idx += 1
             if is_shown:
                 self.graphic(self.board, p1, p2)
             end, winner = self.board.game_end()

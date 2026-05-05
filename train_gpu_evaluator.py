@@ -240,7 +240,12 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
         n_playout = int(args["n_playout"])
         c_puct = float(args["c_puct"])
         temp = float(args["temp"])
-        dirichlet_alpha = float(args.get("dirichlet_alpha", 0.03))
+        temperature_moves = args.get("temperature_moves", None)
+        if temperature_moves is not None:
+            temperature_moves = int(temperature_moves)
+        temp_high = float(args.get("temp_high", 1.0))
+        temp_low = float(args.get("temp_low", 1e-3))
+        dirichlet_alpha = float(args.get("dirichlet_alpha", 0.05))
         noise_eps = float(args.get("noise_eps", 0.25))
 
         print("[worker {}] start: games={}, n_playout={}, pid={}".format(
@@ -267,7 +272,12 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
         start = time.time()
         for game_idx in range(n_games):
             t0 = time.time()
-            winner, play_data = game.start_self_play(mcts_player, temp=temp)
+            winner, play_data = game.start_self_play(
+                mcts_player,
+                temp=temp,
+                temperature_moves=temperature_moves,
+                temp_high=temp_high,
+                temp_low=temp_low)
             play_data = list(play_data)
             episode_lens.append(len(play_data))
             all_data.extend(get_equi_data(play_data, bw, bh))
@@ -304,7 +314,8 @@ class TrainPipeline(object):
                  batch_size=512, game_batch_num=1500, check_freq=50,
                  eval_games=10, eval_batch_size=128, eval_timeout_ms=8,
                  response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
-                 dirichlet_alpha=0.03, noise_eps=0.25,
+                 dirichlet_alpha=0.05, noise_eps=0.25,
+                 temperature_moves=8, temp_high=1.0, temp_low=1e-3,
                  buffer_size=500000, recent_sample_window=200000,
                  worker_model_file="./_tmp_gpu_evaluator_policy.model",
                  batch_log_file="training_batches.log"):
@@ -339,6 +350,9 @@ class TrainPipeline(object):
         self.c_puct = float(c_puct)
         self.dirichlet_alpha = float(dirichlet_alpha)
         self.noise_eps = float(noise_eps)
+        self.temperature_moves = int(temperature_moves) if temperature_moves is not None else None
+        self.temp_high = float(temp_high)
+        self.temp_low = float(temp_low)
         self.buffer_size = int(buffer_size)
         self.recent_sample_window = max(1, int(recent_sample_window))
         self.batch_size = int(batch_size)
@@ -384,6 +398,9 @@ class TrainPipeline(object):
                 "c_puct": self.c_puct,
                 "dirichlet_alpha": self.dirichlet_alpha,
                 "noise_eps": self.noise_eps,
+                "temperature_moves": self.temperature_moves,
+                "temp_high": self.temp_high,
+                "temp_low": self.temp_low,
                 "temp": self.temp,
                 "threads_per_worker": self.threads_per_worker,
                 "response_timeout": self.response_timeout,
@@ -417,9 +434,10 @@ class TrainPipeline(object):
             name="gpu-evaluator")
 
         workers = []
-        print("remote-GPU self-play start: workers={}, games_per_worker={}, n_playout={}, c_puct={}, dirichlet_alpha={}, noise_eps={}, eval_batch_size={}, eval_timeout_ms={}".format(
+        print("remote-GPU self-play start: workers={}, games_per_worker={}, n_playout={}, c_puct={}, dirichlet_alpha={}, noise_eps={}, temperature_moves={}, temp_high={}, temp_low={}, eval_batch_size={}, eval_timeout_ms={}".format(
             self.num_workers, self.games_per_worker, self.n_playout,
             self.c_puct, self.dirichlet_alpha, self.noise_eps,
+            self.temperature_moves, self.temp_high, self.temp_low,
             self.eval_batch_size, self.eval_timeout_ms), flush=True)
         evaluator.start()
 
@@ -674,8 +692,11 @@ def parse_args():
     p.add_argument("--n-playout", type=int, default=800)
     p.add_argument("--eval-n-playout", type=int, default=1600)
     p.add_argument("--c-puct", type=float, default=3.0)
-    p.add_argument("--dirichlet-alpha", type=float, default=0.03)
+    p.add_argument("--dirichlet-alpha", type=float, default=0.05)
     p.add_argument("--noise-eps", type=float, default=0.25)
+    p.add_argument("--temperature-moves", type=int, default=8)
+    p.add_argument("--temp-high", type=float, default=1.0)
+    p.add_argument("--temp-low", type=float, default=1e-3)
     p.add_argument("--buffer-size", type=int, default=500000)
     p.add_argument("--recent-sample-window", type=int, default=200000)
     p.add_argument("--batch-size", type=int, default=512)
@@ -707,6 +728,9 @@ if __name__ == "__main__":
         c_puct=args.c_puct,
         dirichlet_alpha=args.dirichlet_alpha,
         noise_eps=args.noise_eps,
+        temperature_moves=args.temperature_moves,
+        temp_high=args.temp_high,
+        temp_low=args.temp_low,
         buffer_size=args.buffer_size,
         recent_sample_window=args.recent_sample_window,
         batch_size=args.batch_size,

@@ -170,7 +170,7 @@ class MCTSPlayer(object):
 
     def __init__(self, policy_value_function,
                  c_puct=3.0, n_playout=2000, is_selfplay=0,
-                 dirichlet_alpha=0.03, noise_eps=0.25):
+                 dirichlet_alpha=0.05, noise_eps=0.25):
         self.mcts = MCTS(policy_value_function, c_puct, n_playout)
         self._is_selfplay = is_selfplay
         self._dirichlet_alpha = float(dirichlet_alpha)

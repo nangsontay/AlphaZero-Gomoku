@@ -100,8 +100,15 @@ def selfplay_worker(args):
         n_playout = int(args["n_playout"])
         c_puct = float(args["c_puct"])
         temp = float(args["temp"])
+        temperature_moves = args.get("temperature_moves", None)
+        if temperature_moves is not None:
+            temperature_moves = int(temperature_moves)
+        temp_high = float(args.get("temp_high", 1.0))
+        temp_low = float(args.get("temp_low", 1e-3))
         n_games = int(args["n_games"])
         model_file = args["model_file"]
+        dirichlet_alpha = float(args.get("dirichlet_alpha", 0.05))
+        noise_eps = float(args.get("noise_eps", 0.25))
 
         print(
             "[worker {}] start: games={}, n_playout={}, pid={}".format(
@@ -128,7 +135,9 @@ def selfplay_worker(args):
             policy_value_net.policy_value_fn,
             c_puct=c_puct,
             n_playout=n_playout,
-            is_selfplay=1
+            is_selfplay=1,
+            dirichlet_alpha=dirichlet_alpha,
+            noise_eps=noise_eps
         )
 
         all_data = []
@@ -137,7 +146,12 @@ def selfplay_worker(args):
 
         for game_idx in range(n_games):
             game_start = time.time()
-            winner, play_data = game.start_self_play(mcts_player, temp=temp)
+            winner, play_data = game.start_self_play(
+                mcts_player,
+                temp=temp,
+                temperature_moves=temperature_moves,
+                temp_high=temp_high,
+                temp_low=temp_low)
             play_data = list(play_data)
             episode_lens.append(len(play_data))
             all_data.extend(get_equi_data(play_data, board_width, board_height))
@@ -206,6 +220,11 @@ class TrainPipeline(object):
         game_batch_num=1500,
         check_freq=50,
         eval_games=10,
+        dirichlet_alpha=0.05,
+        noise_eps=0.25,
+        temperature_moves=8,
+        temp_high=1.0,
+        temp_low=1e-3,
         worker_model_file="./_tmp_selfplay_policy.model",
     ):
         self.use_gpu = bool(use_gpu)
@@ -238,6 +257,11 @@ class TrainPipeline(object):
         self.temp = 1.0
         self.n_playout = int(n_playout)
         self.c_puct = 5
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.noise_eps = float(noise_eps)
+        self.temperature_moves = int(temperature_moves) if temperature_moves is not None else None
+        self.temp_high = float(temp_high)
+        self.temp_low = float(temp_low)
         self.buffer_size = 10000
         self.batch_size = int(batch_size)
         self.data_buffer = deque(maxlen=self.buffer_size)
@@ -269,7 +293,9 @@ class TrainPipeline(object):
             self.policy_value_net.policy_value_fn,
             c_puct=self.c_puct,
             n_playout=self.n_playout,
-            is_selfplay=1
+            is_selfplay=1,
+            dirichlet_alpha=self.dirichlet_alpha,
+            noise_eps=self.noise_eps
         )
 
     def save_cpu_model_for_workers(self):
@@ -296,6 +322,11 @@ class TrainPipeline(object):
                 "n_playout": self.n_playout,
                 "c_puct": self.c_puct,
                 "temp": self.temp,
+                "dirichlet_alpha": self.dirichlet_alpha,
+                "noise_eps": self.noise_eps,
+                "temperature_moves": self.temperature_moves,
+                "temp_high": self.temp_high,
+                "temp_low": self.temp_low,
                 "threads_per_worker": self.threads_per_worker,
             }
             for worker_id in range(self.num_workers)
@@ -537,6 +568,11 @@ def parse_args():
     parser.add_argument("--game-batch-num", type=int, default=1500)
     parser.add_argument("--check-freq", type=int, default=50)
     parser.add_argument("--eval-games", type=int, default=10)
+    parser.add_argument("--dirichlet-alpha", type=float, default=0.05)
+    parser.add_argument("--noise-eps", type=float, default=0.25)
+    parser.add_argument("--temperature-moves", type=int, default=8)
+    parser.add_argument("--temp-high", type=float, default=1.0)
+    parser.add_argument("--temp-low", type=float, default=1e-3)
     return parser.parse_args()
 
 
@@ -559,5 +595,10 @@ if __name__ == "__main__":
         game_batch_num=args.game_batch_num,
         check_freq=args.check_freq,
         eval_games=args.eval_games,
+        dirichlet_alpha=args.dirichlet_alpha,
+        noise_eps=args.noise_eps,
+        temperature_moves=args.temperature_moves,
+        temp_high=args.temp_high,
+        temp_low=args.temp_low,
     )
     training_pipeline.run()
