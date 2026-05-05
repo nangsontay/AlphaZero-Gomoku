@@ -850,7 +850,7 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
 class TrainPipeline(object):
     def __init__(self, init_model=None, use_gpu=True, num_workers=10,
                  games_per_worker=1, threads_per_worker=1, n_playout=800,
-                 batch_size=512, game_batch_num=1500,
+                 batch_size=512, game_batch_num=1500, check_freq=50,
                  eval_games=10, eval_batch_size=256, eval_timeout_ms=8,
                  response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
                  dirichlet_alpha=0.05, noise_eps=0.25,
@@ -918,6 +918,7 @@ class TrainPipeline(object):
         self.buffer_size = int(buffer_size)
         self.recent_sample_window = max(1, int(recent_sample_window))
         self.batch_size = int(batch_size)
+        self.check_freq = max(1, int(check_freq))
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.epochs = 5
         self.kl_targ = 0.02
@@ -1544,7 +1545,8 @@ class TrainPipeline(object):
                     "updated": update_metrics is not None,
                     "update_metrics": update_metrics,
                 })
-                if update_count > 0 and update_metrics is not None:
+                if (update_count > 0 and update_metrics is not None and
+                        update_count % self.check_freq == 0):
                     print("current training update: {}".format(update_count), flush=True)
                     win_ratio = self.policy_evaluate(self.eval_games)
                     self.policy_value_net.save_model("./current_policy.model")
@@ -1614,6 +1616,8 @@ def parse_args():
     p.add_argument("--recent-sample-window", type=int, default=200000)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--game-batch-num", type=int, default=1500)
+    p.add_argument("--check-freq", type=int, default=50,
+                   help="Run policy evaluation every N training updates.")
     p.add_argument("--eval-games", type=int, default=10)
     p.add_argument("--eval-batch-size", type=int, default=256)
     p.add_argument("--eval-timeout-ms", type=int, default=8)
@@ -1654,6 +1658,7 @@ if __name__ == "__main__":
         recent_sample_window=args.recent_sample_window,
         batch_size=args.batch_size,
         game_batch_num=args.game_batch_num,
+        check_freq=args.check_freq,
         eval_games=args.eval_games,
         eval_batch_size=args.eval_batch_size,
         eval_timeout_ms=args.eval_timeout_ms,
