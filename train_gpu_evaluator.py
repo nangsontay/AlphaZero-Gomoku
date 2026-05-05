@@ -14,10 +14,69 @@ import multiprocessing as mp
 import os
 import queue
 import random
+import signal
 import time
 import traceback
 from collections import defaultdict, deque
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
+
+
+class _ShuttingDown(Exception):
+    """Internal signal: child process should exit cleanly because the parent
+    asked for shutdown (e.g. via Ctrl+C in main)."""
+    pass
+
+
+def _ignore_sigint_in_child():
+    """Make child process ignore SIGINT so Ctrl+C in the terminal does not
+    raise KeyboardInterrupt mid-operation in workers/evaluator. Only the main
+    process handles Ctrl+C; it coordinates shutdown via shutdown_event."""
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        # Not on main thread of child? best-effort.
+        pass
+
+
+def _unregister_shm_from_tracker(shm):
+    """Workaround for https://bugs.python.org/issue38119 — when a child opens
+    an existing SharedMemory by name, multiprocessing.resource_tracker
+    over-registers it and emits a spurious "leaked shared_memory" warning at
+    interpreter shutdown. The parent owns the lifetime; tell the tracker to
+    forget about it in the child."""
+    if shm is None:
+        return
+    name = getattr(shm, "_name", None) or getattr(shm, "name", None)
+    if not name:
+        return
+    try:
+        resource_tracker.unregister(name, "shared_memory")
+    except Exception:
+        pass
+
+
+def _attach_parent_owned_shm(name):
+    """Attach to parent-owned SharedMemory without registering it in this child.
+
+    The old workaround opened SharedMemory normally, then called
+    resource_tracker.unregister(). With multiple children attached to the same
+    parent-owned block, those duplicate UNREGISTER messages can make the shared
+    resource_tracker process remove a name that is no longer in its cache and
+    print a shutdown KeyError. Avoid that race entirely by suppressing only the
+    child-side shared_memory REGISTER that SharedMemory(name=...) performs.
+    """
+    original_register = resource_tracker.register
+
+    def register(resource_name, rtype):
+        if rtype == "shared_memory":
+            return
+        return original_register(resource_name, rtype)
+
+    resource_tracker.register = register
+    try:
+        return shared_memory.SharedMemory(name=name)
+    finally:
+        resource_tracker.register = original_register
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -74,7 +133,8 @@ class RemotePolicyValueClient(object):
     def __init__(self, worker_id, board_width, board_height,
                  request_queue, response_queue, response_timeout=180.0,
                  log_every=2000, slot_pool_queue=None, shm_in_name=None,
-                 shm_out_name=None, shm_slots=0, in_channels=4):
+                 shm_out_name=None, shm_slots=0, in_channels=4,
+                 shutdown_event=None, poll_interval=0.5):
         self.worker_id = int(worker_id)
         self.board_width = int(board_width)
         self.board_height = int(board_height)
@@ -91,9 +151,14 @@ class RemotePolicyValueClient(object):
         self.shm_out = None
         self.shm_in_view = None
         self.shm_out_view = None
+        self.shutdown_event = shutdown_event
+        self.poll_interval = max(0.05, float(poll_interval))
         if shm_in_name and shm_out_name and slot_pool_queue is not None:
-            self.shm_in = shared_memory.SharedMemory(name=shm_in_name)
-            self.shm_out = shared_memory.SharedMemory(name=shm_out_name)
+            # Parent owns the lifetime; do not register these attachments in
+            # this child, otherwise duplicate unregisters can trip the shared
+            # resource_tracker at process shutdown.
+            self.shm_in = _attach_parent_owned_shm(shm_in_name)
+            self.shm_out = _attach_parent_owned_shm(shm_out_name)
             self.shm_in_view = np.ndarray(
                 (self.shm_slots, self.in_channels,
                  self.board_width, self.board_height),
@@ -105,6 +170,44 @@ class RemotePolicyValueClient(object):
                 dtype=np.float32,
                 buffer=self.shm_out.buf,
             )
+
+    def _shutdown_requested(self):
+        return self.shutdown_event is not None and self.shutdown_event.is_set()
+
+    def _get_response_cooperative(self):
+        """Wait for a response while remaining responsive to shutdown_event.
+
+        Polls response_queue with a short timeout; bails out promptly if the
+        parent signaled shutdown. Raises queue.Empty after response_timeout
+        seconds of no response, or _ShuttingDown when the parent asked us to
+        stop."""
+        deadline = time.time() + self.response_timeout
+        while True:
+            if self._shutdown_requested():
+                raise _ShuttingDown()
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise queue.Empty()
+            try:
+                return self.response_queue.get(
+                    timeout=min(self.poll_interval, remaining))
+            except queue.Empty:
+                continue
+
+    def _get_slot_cooperative(self):
+        """Acquire a shared-memory slot while remaining responsive to shutdown."""
+        deadline = time.time() + self.response_timeout
+        while True:
+            if self._shutdown_requested():
+                raise _ShuttingDown()
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise queue.Empty()
+            try:
+                return self.slot_pool_queue.get(
+                    timeout=min(self.poll_interval, remaining))
+            except queue.Empty:
+                continue
 
     def close(self):
         self.shm_in_view = None
@@ -122,14 +225,14 @@ class RemotePolicyValueClient(object):
                 self.shm_out_view is not None)
 
     def _send_shared_request(self, state, rid):
-        slot = self.slot_pool_queue.get(timeout=self.response_timeout)
+        slot = self._get_slot_cooperative()
         released = False
         try:
             self.shm_in_view[slot] = np.ascontiguousarray(state, dtype=np.float32)
             self.request_queue.put((int(slot), self.worker_id, int(rid)))
             while True:
                 try:
-                    resp = self.response_queue.get(timeout=self.response_timeout)
+                    resp = self._get_response_cooperative()
                 except queue.Empty:
                     raise RuntimeError(
                         "worker {} timed out waiting for GPU evaluator rid={}".format(
@@ -186,7 +289,7 @@ class RemotePolicyValueClient(object):
 
         while True:
             try:
-                resp = self.response_queue.get(timeout=self.response_timeout)
+                resp = self._get_response_cooperative()
             except queue.Empty:
                 raise RuntimeError(
                     "worker {} timed out waiting for GPU evaluator rid={}".format(
@@ -227,7 +330,7 @@ class RemotePolicyValueClient(object):
                     if self.log_every > 0 and rid % self.log_every == 0:
                         print("[worker {}] eval requests sent: {}".format(
                             self.worker_id, rid), flush=True)
-                    slot = self.slot_pool_queue.get(timeout=self.response_timeout)
+                    slot = self._get_slot_cooperative()
                     slots_by_rid[rid] = slot
                     self.shm_in_view[slot] = states_np[i]
                     self.request_queue.put((int(slot), self.worker_id, int(rid)))
@@ -260,7 +363,7 @@ class RemotePolicyValueClient(object):
         try:
             while received < batch_size:
                 try:
-                    resp = self.response_queue.get(timeout=self.response_timeout)
+                    resp = self._get_response_cooperative()
                 except queue.Empty:
                     raise RuntimeError(
                         "worker {} timed out waiting for GPU evaluator batch={} received={}".format(
@@ -371,6 +474,7 @@ def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
                        shutdown_event=None, shm_in_name=None, shm_out_name=None,
                        shm_slots=0, in_channels=4, use_cuda_graphs=True,
                        inference_fp16=True):
+    _ignore_sigint_in_child()
     set_cpu_threads(threads)
     total_requests = 0
     total_batches = 0
@@ -433,8 +537,11 @@ def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
             cuda_graph = capture_cuda_graph_or_none()
 
         if shm_in_name and shm_out_name:
-            shm_in = shared_memory.SharedMemory(name=shm_in_name)
-            shm_out = shared_memory.SharedMemory(name=shm_out_name)
+            # Parent owns the shm lifetime; avoid child-side tracking instead
+            # of registering and then manually unregistering, which can send a
+            # duplicate UNREGISTER and trigger resource_tracker KeyError.
+            shm_in = _attach_parent_owned_shm(shm_in_name)
+            shm_out = _attach_parent_owned_shm(shm_out_name)
             shm_in_view = np.ndarray(
                 (int(shm_slots), int(in_channels), int(board_width), int(board_height)),
                 dtype=np.float32,
@@ -548,9 +655,11 @@ def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
             float(total_requests) / max(1, total_batches), max_batch, elapsed),
             flush=True)
 
-    except Exception as exc:
+    except BaseException as exc:
         tb = traceback.format_exc()
         err = "{}\n{}".format(exc, tb)
+        # KeyboardInterrupt should not normally reach here because we install
+        # SIG_IGN at startup, but keep the handler defensive.
         print("[gpu-evaluator] ERROR:\n{}".format(err), flush=True)
         for q in response_queues:
             try:
@@ -571,14 +680,30 @@ def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
         shm_in_view = None
         shm_out_view = None
         if shm_in is not None:
-            shm_in.close()
+            try:
+                shm_in.close()
+            except Exception:
+                pass
         if shm_out is not None:
-            shm_out.close()
+            try:
+                shm_out.close()
+            except Exception:
+                pass
+        # Don't block waiting for queue feeder threads at exit if the parent
+        # has stopped consuming.
+        for q in [request_queue, stats_queue] + list(response_queues or []):
+            if q is None:
+                continue
+            try:
+                q.cancel_join_thread()
+            except Exception:
+                pass
 
 
 def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                            shutdown_event=None, slot_pool_queue=None,
                            shm_in_name=None, shm_out_name=None, shm_slots=0):
+    _ignore_sigint_in_child()
     wid = int(args["worker_id"])
     client = None
     try:
@@ -624,6 +749,7 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
             shm_in_name=shm_in_name,
             shm_out_name=shm_out_name,
             shm_slots=shm_slots,
+            shutdown_event=shutdown_event,
         )
         mcts_player = MCTSPlayer(client.policy_value_fn,
                                  client.policy_value_batch_fn,
@@ -684,31 +810,47 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                 "eval_requests": client.request_id,
                 "elapsed": time.time() - start,
             })
-    except Exception as exc:
+    except _ShuttingDown:
+        # Parent asked for shutdown; exit cleanly without noise.
+        print("[worker {}] shutdown requested; exiting".format(wid), flush=True)
+    except BaseException as exc:
         tb = traceback.format_exc()
         print("[worker {}] ERROR: {}\n{}".format(wid, exc, tb), flush=True)
-        try:
-            replay_queue.put({
-                "ok": False,
-                "worker_id": wid,
-                "error": str(exc),
-                "traceback": tb,
-                "data": [],
-                "episode_lens": [],
-                "eval_requests": getattr(client, "request_id", 0),
-                "elapsed": 0.0,
-            }, timeout=5.0)
-        except Exception:
-            pass
+        if shutdown_event is None or not shutdown_event.is_set():
+            try:
+                replay_queue.put({
+                    "ok": False,
+                    "worker_id": wid,
+                    "error": str(exc),
+                    "traceback": tb,
+                    "data": [],
+                    "episode_lens": [],
+                    "eval_requests": getattr(client, "request_id", 0),
+                    "elapsed": 0.0,
+                }, timeout=5.0)
+            except Exception:
+                pass
     finally:
         if client is not None:
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                pass
+        # Avoid hanging Python's queue feeder threads at process exit if the
+        # parent has already left the consumer side.
+        for q in (request_queue, response_queue, replay_queue, slot_pool_queue):
+            if q is None:
+                continue
+            try:
+                q.cancel_join_thread()
+            except Exception:
+                pass
 
 
 class TrainPipeline(object):
     def __init__(self, init_model=None, use_gpu=True, num_workers=10,
                  games_per_worker=1, threads_per_worker=1, n_playout=800,
-                 batch_size=512, game_batch_num=1500, check_freq=50,
+                 batch_size=512, game_batch_num=1500,
                  eval_games=10, eval_batch_size=256, eval_timeout_ms=8,
                  response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
                  dirichlet_alpha=0.05, noise_eps=0.25,
@@ -787,7 +929,6 @@ class TrainPipeline(object):
             (40000, 1e-4),
             (float("inf"), 2e-5),
         ]
-        self.check_freq = int(check_freq)
         self.game_batch_num = int(game_batch_num)
         self.eval_games = int(eval_games)
         self.best_win_ratio = 0.0
@@ -913,27 +1054,134 @@ class TrainPipeline(object):
             self.temp_low, self.eval_batch_size, self.eval_timeout_ms),
             flush=True)
 
+    def _drain_queue(self, q, max_items=10000):
+        """Best-effort drain of a multiprocessing queue so the producer's
+        feeder thread can flush and the join doesn't deadlock."""
+        if q is None:
+            return 0
+        drained = 0
+        while drained < max_items:
+            try:
+                q.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+            except (OSError, ValueError, EOFError):
+                break
+            except Exception:
+                break
+        return drained
+
     def stop_async_pipeline(self):
+        if not self.pipeline_started and not self.worker_procs and self.evaluator_proc is None:
+            self.cleanup_shared_memory()
+            return
+
+        # 1. Tell every child to stop.
         if self.shutdown_event is not None:
-            self.shutdown_event.set()
+            try:
+                self.shutdown_event.set()
+            except Exception:
+                pass
         if self.request_queue is not None:
+            # Send one sentinel per child so any worker still polling
+            # request_queue (none currently do, but the evaluator does) wakes
+            # up promptly.
             try:
                 self.request_queue.put({"type": "shutdown"})
             except Exception:
                 pass
+
+        worker_join_timeout = 5.0
+        evaluator_join_timeout = 10.0
+
+        # 2. Continuously drain response/replay/stats queues while waiting on
+        # workers. This unblocks any worker still trying to put a final replay
+        # item, and prevents feeder threads from holding locks.
+        deadline = time.time() + worker_join_timeout
+        while time.time() < deadline:
+            self._drain_queue(self.replay_queue)
+            self._drain_queue(self.stats_queue)
+            for rq in (self.response_queues or []):
+                self._drain_queue(rq)
+            if all(not p.is_alive() for p in self.worker_procs):
+                break
+            time.sleep(0.1)
+
         for p in list(self.worker_procs):
-            p.join(timeout=30)
+            p.join(timeout=1.0)
             if p.is_alive():
                 print("terminating stuck worker {}".format(p.name), flush=True)
-                p.terminate()
-                p.join(timeout=10)
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+                p.join(timeout=3.0)
+                if p.is_alive():
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    p.join(timeout=1.0)
+
+        # 3. Wait for evaluator, draining its inputs/outputs in parallel.
         if self.evaluator_proc is not None:
-            self.evaluator_proc.join(timeout=60)
+            ev_deadline = time.time() + evaluator_join_timeout
+            while time.time() < ev_deadline and self.evaluator_proc.is_alive():
+                self._drain_queue(self.request_queue)
+                self._drain_queue(self.stats_queue)
+                for rq in (self.response_queues or []):
+                    self._drain_queue(rq)
+                self.evaluator_proc.join(timeout=0.2)
             if self.evaluator_proc.is_alive():
                 print("terminating stuck GPU evaluator", flush=True)
-                self.evaluator_proc.terminate()
-                self.evaluator_proc.join(timeout=10)
+                try:
+                    self.evaluator_proc.terminate()
+                except Exception:
+                    pass
+                self.evaluator_proc.join(timeout=3.0)
+                if self.evaluator_proc.is_alive():
+                    try:
+                        self.evaluator_proc.kill()
+                    except Exception:
+                        pass
+                    self.evaluator_proc.join(timeout=1.0)
+
+        # 4. Final drain so our own feeder threads don't block at process
+        # exit, then explicitly cancel join threads on every queue.
+        self._drain_queue(self.request_queue)
+        self._drain_queue(self.replay_queue)
+        self._drain_queue(self.stats_queue)
+        self._drain_queue(self.slot_pool_queue)
+        for rq in (self.response_queues or []):
+            self._drain_queue(rq)
+
+        all_queues = [
+            self.request_queue, self.replay_queue, self.stats_queue,
+            self.slot_pool_queue,
+        ] + list(self.response_queues or [])
+        for q in all_queues:
+            if q is None:
+                continue
+            try:
+                q.cancel_join_thread()
+            except Exception:
+                pass
+            try:
+                q.close()
+            except Exception:
+                pass
+
+        # 5. Release shared memory last; children are gone so unlink is safe.
         self.cleanup_shared_memory()
+
+        self.worker_procs = []
+        self.evaluator_proc = None
+        self.request_queue = None
+        self.response_queues = None
+        self.replay_queue = None
+        self.stats_queue = None
+        self.slot_pool_queue = None
         self.pipeline_started = False
 
     def build_worker_args(self):
@@ -1296,7 +1544,7 @@ class TrainPipeline(object):
                     "updated": update_metrics is not None,
                     "update_metrics": update_metrics,
                 })
-                if update_count > 0 and update_metrics is not None and update_count % self.check_freq == 0:
+                if update_count > 0 and update_metrics is not None:
                     print("current training update: {}".format(update_count), flush=True)
                     win_ratio = self.policy_evaluate(self.eval_games)
                     self.policy_value_net.save_model("./current_policy.model")
@@ -1310,12 +1558,34 @@ class TrainPipeline(object):
             if last_save_update != update_count:
                 self.policy_value_net.save_model("./current_policy.model")
         except KeyboardInterrupt:
-            print("\nInterrupted. Saving checkpoint...", flush=True)
-            self.policy_value_net.save_model("./interrupt_policy.model")
-            self.policy_value_net.save_model("./current_policy.model")
-            print("Saved: interrupt_policy.model and current_policy.model", flush=True)
+            # Save the model FIRST, before any cleanup that could block, so a
+            # second Ctrl+C cannot prevent us from persisting the latest
+            # weights.
+            print("\nInterrupted. Saving checkpoint immediately...", flush=True)
+            saved_paths = []
+            for path in ("./interrupt_policy.model", "./current_policy.model"):
+                try:
+                    self.policy_value_net.save_model(path)
+                    saved_paths.append(path)
+                except BaseException as save_exc:
+                    print("Save FAILED for {}: {}".format(path, save_exc),
+                          flush=True)
+            if saved_paths:
+                print("Saved: {}".format(", ".join(saved_paths)), flush=True)
+            else:
+                print("WARNING: no checkpoint files were saved.", flush=True)
+            # Signal children to exit ASAP so the join in `finally` is fast.
+            if self.shutdown_event is not None:
+                try:
+                    self.shutdown_event.set()
+                except Exception:
+                    pass
         finally:
-            self.stop_async_pipeline()
+            try:
+                self.stop_async_pipeline()
+            except BaseException as stop_exc:
+                print("stop_async_pipeline error: {}".format(stop_exc),
+                      flush=True)
 
 
 def parse_args():
@@ -1344,7 +1614,6 @@ def parse_args():
     p.add_argument("--recent-sample-window", type=int, default=200000)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--game-batch-num", type=int, default=1500)
-    p.add_argument("--check-freq", type=int, default=50)
     p.add_argument("--eval-games", type=int, default=10)
     p.add_argument("--eval-batch-size", type=int, default=256)
     p.add_argument("--eval-timeout-ms", type=int, default=8)
@@ -1385,7 +1654,6 @@ if __name__ == "__main__":
         recent_sample_window=args.recent_sample_window,
         batch_size=args.batch_size,
         game_batch_num=args.game_batch_num,
-        check_freq=args.check_freq,
         eval_games=args.eval_games,
         eval_batch_size=args.eval_batch_size,
         eval_timeout_ms=args.eval_timeout_ms,
