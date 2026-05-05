@@ -1488,15 +1488,46 @@ class TrainPipeline(object):
             n_games = self.eval_games
         if n_games <= 0:
             return self.best_win_ratio
+
+        def policy_value_batch_fn(states_np):
+            return self.policy_value_net.policy_value_inference(states_np)
+
+        print(
+            "Starting policy evaluation against Pure MCTS for {} games...".format(
+                n_games
+            ),
+            flush=True,
+        )
         current = MCTSPlayer(self.policy_value_net.policy_value_fn,
+                             policy_value_batch_fn,
                              c_puct=self.c_puct,
-                             n_playout=self.eval_n_playout)
+                             n_playout=self.eval_n_playout,
+                             vl_k=self.vl_k,
+                             n_vl=self.n_vl,
+                             max_oversample=self.max_oversample)
         pure = MCTS_Pure(c_puct=5, n_playout=self.pure_mcts_playout_num)
         win_cnt = defaultdict(int)
+        eval_start = time.time()
         for i in range(n_games):
+            game_start = time.time()
             winner = self.game.start_play(current, pure, start_player=i % 2,
                                           is_shown=0)
             win_cnt[winner] += 1
+            elapsed = time.time() - game_start
+            total_elapsed = time.time() - eval_start
+            print(
+                "Evaluation game {}/{} finished: winner={}, win={}, lose={}, tie={}, elapsed={:.1f}s, total_elapsed={:.1f}s".format(
+                    i + 1,
+                    n_games,
+                    winner,
+                    win_cnt[1],
+                    win_cnt[2],
+                    win_cnt[-1],
+                    elapsed,
+                    total_elapsed,
+                ),
+                flush=True,
+            )
         win_ratio = 1.0 * (win_cnt[1] + 0.5 * win_cnt[-1]) / n_games
         print("num_playouts:{}, win: {}, lose: {}, tie:{}".format(
             self.pure_mcts_playout_num, win_cnt[1], win_cnt[2], win_cnt[-1]),
