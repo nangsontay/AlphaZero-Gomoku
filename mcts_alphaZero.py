@@ -7,7 +7,6 @@ network to guide the tree search and evaluate the leaf nodes
 import numpy as np
 import copy
 
-
 def softmax(x):
     probs = np.exp(x - np.max(x))
     probs /= np.sum(probs)
@@ -114,22 +113,22 @@ class MCTS(object):
             action, node = node.select(self._c_puct)
             state.do_move(action)
 
-        # Evaluate the leaf using a network which outputs a list of
-        # (action, probability) tuples p and also a score v in [-1, 1]
-        # for the current player.
-        action_probs, leaf_value = self._policy(state)
-        # Check for end of game.
+        # Check terminal leaves before calling the neural net. Terminal
+        # states have exact values and do not need GPU inference.
         end, winner = state.game_end()
-        if not end:
-            node.expand(action_probs)
-        else:
-            # for end state，return the "true" leaf_value
+        if end:
             if winner == -1:  # tie
                 leaf_value = 0.0
             else:
                 leaf_value = (
                     1.0 if winner == state.get_current_player() else -1.0
                 )
+        else:
+            # Evaluate the leaf using a network which outputs a list of
+            # (action, probability) tuples p and also a score v in [-1, 1]
+            # for the current player.
+            action_probs, leaf_value = self._policy(state)
+            node.expand(action_probs)
 
         # Update value and visit count of nodes in this traversal.
         node.update_recursive(-leaf_value)

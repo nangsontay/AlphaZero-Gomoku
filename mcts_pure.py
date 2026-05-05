@@ -119,16 +119,15 @@ class MCTS(object):
         node = self._root
         while(1):
             if node.is_leaf():
-
                 break
             # Greedily select next move.
             action, node = node.select(self._c_puct)
             state.do_move(action)
 
-        action_probs, _ = self._policy(state)
-        # Check for end of game
+        # Check terminal leaves before expanding the node.
         end, winner = state.game_end()
         if not end:
+            action_probs, _ = self._policy(state)
             node.expand(action_probs)
         # Evaluate the leaf node by random rollout
         leaf_value = self._evaluate_rollout(state)
