@@ -184,6 +184,25 @@ class PolicyValueNet:
         value = value.detach().cpu().numpy()
         return act_probs, value
 
+    def policy_value_inference(self, state_batch, fp16=False,
+                               channels_last=False):
+        """Evaluator-only inference path for persistent FP16/channels_last nets."""
+        self.policy_value_net.eval()
+
+        arr = np.asarray(state_batch, dtype=np.float32)
+        state_tensor = torch.from_numpy(arr).to(self.device, non_blocking=True)
+        if fp16 and self.use_gpu:
+            state_tensor = state_tensor.half()
+        if channels_last:
+            state_tensor = state_tensor.to(memory_format=torch.channels_last)
+
+        with torch.no_grad():
+            log_act_probs, value = self.policy_value_net(state_tensor)
+
+        act_probs = torch.exp(log_act_probs.float()).detach().cpu().numpy()
+        value = value.float().detach().cpu().numpy()
+        return act_probs, value
+
     def policy_value_fn(self, board):
         """
         input: board

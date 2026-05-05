@@ -33,6 +33,25 @@ class Board(object):
         self.states = {}
         self.last_move = -1
 
+    def copy_fast(self):
+        """Return a fast Board copy for MCTS simulations.
+
+        Rule constants are copied by reference/value, while the mutable move
+        tracking containers that do_move() mutates are cloned explicitly.
+        """
+        new = Board.__new__(Board)
+        new.width = self.width
+        new.height = self.height
+        new.n_in_row = self.n_in_row
+        new.players = self.players
+        new.states = dict(self.states)
+        new.availables = list(self.availables)
+        new._available_set = set(self._available_set)
+        new._available_pos = dict(self._available_pos)
+        new.current_player = self.current_player
+        new.last_move = self.last_move
+        return new
+
     def move_to_location(self, move):
         h = move // self.width
         w = move % self.width
@@ -193,23 +212,35 @@ class Game(object):
                         print("Game end. Tie")
                 return winner
 
-    def start_self_play(self, player, is_shown=0, temp=1e-3):
+    def start_self_play(self, player, is_shown=0, temp=1e-3,
+                        temperature_moves=None, temp_high=1.0,
+                        temp_low=1e-3):
         """ start a self-play game using a MCTS player, reuse the search tree,
         and store the self-play data: (state, mcts_probs, z) for training
+
+        temp remains as the backward-compatible fixed-temperature path when
+        temperature_moves is None. Pass temperature_moves=0 to use temp_low
+        for the whole game, or a positive value to use temp_high for the first
+        temperature_moves plies and temp_low afterwards.
         """
         self.board.init_board()
         p1, p2 = self.board.players
         states, mcts_probs, current_players = [], [], []
+        move_idx = 0
         while True:
+            cur_temp = temp
+            if temperature_moves is not None:
+                cur_temp = temp_high if move_idx < temperature_moves else temp_low
             move, move_probs = player.get_action(self.board,
-                                                 temp=temp,
+                                                 temp=cur_temp,
                                                  return_prob=1)
             # store the data
-            states.append(self.board.current_state())
+            states.append(self.board.current_state().copy())
             mcts_probs.append(move_probs)
             current_players.append(self.board.current_player)
             # perform a move
             self.board.do_move(move)
+            move_idx += 1
             if is_shown:
                 self.graphic(self.board, p1, p2)
             end, winner = self.board.game_end()
