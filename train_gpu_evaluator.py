@@ -17,6 +17,7 @@ import random
 import time
 import traceback
 from collections import defaultdict, deque
+from multiprocessing import shared_memory
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -72,15 +73,92 @@ class RemotePolicyValueClient(object):
 
     def __init__(self, worker_id, board_width, board_height,
                  request_queue, response_queue, response_timeout=180.0,
-                 log_every=2000):
+                 log_every=2000, slot_pool_queue=None, shm_in_name=None,
+                 shm_out_name=None, shm_slots=0, in_channels=4):
         self.worker_id = int(worker_id)
         self.board_width = int(board_width)
         self.board_height = int(board_height)
+        self.board_size = self.board_width * self.board_height
+        self.in_channels = int(in_channels)
         self.request_queue = request_queue
         self.response_queue = response_queue
         self.response_timeout = float(response_timeout)
         self.log_every = int(log_every)
         self.request_id = 0
+        self.slot_pool_queue = slot_pool_queue
+        self.shm_slots = int(shm_slots or 0)
+        self.shm_in = None
+        self.shm_out = None
+        self.shm_in_view = None
+        self.shm_out_view = None
+        if shm_in_name and shm_out_name and slot_pool_queue is not None:
+            self.shm_in = shared_memory.SharedMemory(name=shm_in_name)
+            self.shm_out = shared_memory.SharedMemory(name=shm_out_name)
+            self.shm_in_view = np.ndarray(
+                (self.shm_slots, self.in_channels,
+                 self.board_width, self.board_height),
+                dtype=np.float32,
+                buffer=self.shm_in.buf,
+            )
+            self.shm_out_view = np.ndarray(
+                (self.shm_slots, self.board_size + 1),
+                dtype=np.float32,
+                buffer=self.shm_out.buf,
+            )
+
+    def close(self):
+        self.shm_in_view = None
+        self.shm_out_view = None
+        if self.shm_in is not None:
+            self.shm_in.close()
+            self.shm_in = None
+        if self.shm_out is not None:
+            self.shm_out.close()
+            self.shm_out = None
+
+    def _has_shared_memory(self):
+        return (self.slot_pool_queue is not None and
+                self.shm_in_view is not None and
+                self.shm_out_view is not None)
+
+    def _send_shared_request(self, state, rid):
+        slot = self.slot_pool_queue.get(timeout=self.response_timeout)
+        released = False
+        try:
+            self.shm_in_view[slot] = np.ascontiguousarray(state, dtype=np.float32)
+            self.request_queue.put((int(slot), self.worker_id, int(rid)))
+            while True:
+                try:
+                    resp = self.response_queue.get(timeout=self.response_timeout)
+                except queue.Empty:
+                    raise RuntimeError(
+                        "worker {} timed out waiting for GPU evaluator rid={}".format(
+                            self.worker_id, rid
+                        )
+                    )
+                if isinstance(resp, dict) and resp.get("type") == "error":
+                    raise RuntimeError("GPU evaluator error: {}".format(
+                        resp.get("error")))
+                if isinstance(resp, dict):
+                    resp_slot = resp.get("slot")
+                    resp_rid = resp.get("request_id")
+                else:
+                    resp_slot, resp_rid = resp[0], resp[1]
+                if int(resp_rid) != int(rid):
+                    continue
+                if int(resp_slot) != int(slot):
+                    continue
+                priors = self.shm_out_view[slot, :self.board_size].copy()
+                value = float(self.shm_out_view[slot, self.board_size])
+                self.slot_pool_queue.put(slot)
+                released = True
+                return priors, value
+        finally:
+            if not released:
+                try:
+                    self.slot_pool_queue.put(slot)
+                except Exception:
+                    pass
 
     def policy_value_fn(self, board):
         legal_positions = board.availables
@@ -94,6 +172,10 @@ class RemotePolicyValueClient(object):
         if self.log_every > 0 and rid % self.log_every == 0:
             print("[worker {}] eval requests sent: {}".format(
                 self.worker_id, rid), flush=True)
+
+        if self._has_shared_memory():
+            act_probs, value = self._send_shared_request(state, rid)
+            return zip(legal_positions, act_probs[legal_positions]), value
 
         self.request_queue.put({
             "type": "eval",
@@ -135,75 +217,263 @@ class RemotePolicyValueClient(object):
                     np.empty((0,), dtype=np.float32))
 
         rids = []
-        for i in range(batch_size):
-            self.request_id += 1
-            rid = self.request_id
-            rids.append(rid)
-            if self.log_every > 0 and rid % self.log_every == 0:
-                print("[worker {}] eval requests sent: {}".format(
-                    self.worker_id, rid), flush=True)
-            self.request_queue.put({
-                "type": "eval",
-                "worker_id": self.worker_id,
-                "request_id": rid,
-                "state": np.ascontiguousarray(states_np[i]),
-            })
+        slots_by_rid = {}
+        if self._has_shared_memory():
+            try:
+                for i in range(batch_size):
+                    self.request_id += 1
+                    rid = self.request_id
+                    rids.append(rid)
+                    if self.log_every > 0 and rid % self.log_every == 0:
+                        print("[worker {}] eval requests sent: {}".format(
+                            self.worker_id, rid), flush=True)
+                    slot = self.slot_pool_queue.get(timeout=self.response_timeout)
+                    slots_by_rid[rid] = slot
+                    self.shm_in_view[slot] = states_np[i]
+                    self.request_queue.put((int(slot), self.worker_id, int(rid)))
+            except Exception:
+                for slot in list(slots_by_rid.values()):
+                    try:
+                        self.slot_pool_queue.put(slot)
+                    except Exception:
+                        pass
+                raise
+        else:
+            for i in range(batch_size):
+                self.request_id += 1
+                rid = self.request_id
+                rids.append(rid)
+                if self.log_every > 0 and rid % self.log_every == 0:
+                    print("[worker {}] eval requests sent: {}".format(
+                        self.worker_id, rid), flush=True)
+                self.request_queue.put({
+                    "type": "eval",
+                    "worker_id": self.worker_id,
+                    "request_id": rid,
+                    "state": np.ascontiguousarray(states_np[i]),
+                })
 
         rid_to_idx = {rid: i for i, rid in enumerate(rids)}
         priors_out = [None] * batch_size
         values_out = np.empty(batch_size, dtype=np.float32)
         received = 0
-        while received < batch_size:
-            try:
-                resp = self.response_queue.get(timeout=self.response_timeout)
-            except queue.Empty:
-                raise RuntimeError(
-                    "worker {} timed out waiting for GPU evaluator batch={} received={}".format(
-                        self.worker_id, batch_size, received
+        try:
+            while received < batch_size:
+                try:
+                    resp = self.response_queue.get(timeout=self.response_timeout)
+                except queue.Empty:
+                    raise RuntimeError(
+                        "worker {} timed out waiting for GPU evaluator batch={} received={}".format(
+                            self.worker_id, batch_size, received
+                        )
                     )
-                )
-            if resp.get("type") == "error":
-                raise RuntimeError("GPU evaluator error: {}".format(
-                    resp.get("error")))
-            rid = resp.get("request_id")
-            if rid not in rid_to_idx:
-                continue
-            idx = rid_to_idx[rid]
-            if priors_out[idx] is not None:
-                continue
-            priors_out[idx] = np.asarray(resp["act_probs"], dtype=np.float32)
-            values_out[idx] = float(resp["value"])
-            received += 1
+                if isinstance(resp, dict) and resp.get("type") == "error":
+                    raise RuntimeError("GPU evaluator error: {}".format(
+                        resp.get("error")))
+                if isinstance(resp, dict):
+                    rid = resp.get("request_id")
+                    slot = resp.get("slot")
+                else:
+                    slot, rid = resp[0], resp[1]
+                if rid not in rid_to_idx:
+                    continue
+                idx = rid_to_idx[rid]
+                if priors_out[idx] is not None:
+                    continue
+                if self._has_shared_memory():
+                    expected_slot = slots_by_rid[rid]
+                    if int(slot) != int(expected_slot):
+                        continue
+                    priors_out[idx] = self.shm_out_view[expected_slot, :self.board_size].copy()
+                    values_out[idx] = float(self.shm_out_view[expected_slot, self.board_size])
+                    self.slot_pool_queue.put(expected_slot)
+                    del slots_by_rid[rid]
+                else:
+                    priors_out[idx] = np.asarray(resp["act_probs"], dtype=np.float32)
+                    values_out[idx] = float(resp["value"])
+                received += 1
+        finally:
+            for slot in list(slots_by_rid.values()):
+                try:
+                    self.slot_pool_queue.put(slot)
+                except Exception:
+                    pass
 
         return np.stack(priors_out), values_out
 
 
+class CudaGraphInferenceWrapper(object):
+    """Fixed-batch CUDA Graph inference wrapper for evaluator-only use."""
+
+    def __init__(self, model, batch_size, in_shape, device,
+                 dtype=torch.float16):
+        self.model = model
+        self.batch_size = int(batch_size)
+        self.in_shape = tuple(int(x) for x in in_shape)
+        self.device = device
+        self.dtype = dtype
+        self.static_in = torch.zeros(
+            (self.batch_size,) + self.in_shape,
+            device=self.device,
+            dtype=self.dtype,
+        ).to(memory_format=torch.channels_last)
+        self.graph = None
+        self.static_log_p = None
+        self.static_v = None
+        self.capture()
+
+    def capture(self):
+        self.model.eval()
+        warmup_stream = torch.cuda.Stream(device=self.device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(warmup_stream):
+            with torch.no_grad():
+                for _ in range(3):
+                    self.model(self.static_in)
+        torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
+        torch.cuda.synchronize(self.device)
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.no_grad():
+            with torch.cuda.graph(self.graph):
+                self.static_log_p, self.static_v = self.model(self.static_in)
+
+    def run(self, batch_np):
+        batch_np = np.ascontiguousarray(batch_np, dtype=np.float32)
+        n = int(batch_np.shape[0])
+        if n > self.batch_size:
+            raise ValueError("batch {} > captured size {}".format(
+                n, self.batch_size))
+        if n == 0:
+            board_size = int(self.static_log_p.shape[1])
+            return (np.empty((0, board_size), dtype=np.float32),
+                    np.empty((0, 1), dtype=np.float32))
+
+        host = torch.from_numpy(batch_np)
+        if self.dtype == torch.float16:
+            host = host.half()
+        host = host.to(memory_format=torch.channels_last)
+        self.static_in[:n].copy_(host.to(self.device, non_blocking=True),
+                                 non_blocking=True)
+        if n < self.batch_size:
+            self.static_in[n:].zero_()
+        self.graph.replay()
+        torch.cuda.synchronize(self.device)
+        priors = torch.exp(self.static_log_p[:n].float()).detach().cpu().numpy()
+        values = self.static_v[:n].float().detach().cpu().numpy()
+        return priors, values
+
+
 def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
-                       response_queues, stats_queue, eval_batch_size=64,
+                       response_queues, stats_queue, eval_batch_size=256,
                        eval_timeout_ms=5, use_gpu=True, threads=1,
-                       log_every_batches=200):
+                       log_every_batches=200, weight_event=None,
+                       shutdown_event=None, shm_in_name=None, shm_out_name=None,
+                       shm_slots=0, in_channels=4, use_cuda_graphs=True,
+                       inference_fp16=True):
     set_cpu_threads(threads)
     total_requests = 0
     total_batches = 0
     max_batch = 0
     start = time.time()
+    shm_in = None
+    shm_out = None
+    shm_in_view = None
+    shm_out_view = None
+    board_size = int(board_width) * int(board_height)
     try:
         print("[gpu-evaluator] loading {} use_gpu={}".format(
             model_file, use_gpu), flush=True)
         net = PolicyValueNet(board_width, board_height,
-                             model_file=model_file, use_gpu=use_gpu)
-        if use_gpu and torch.cuda.is_available():
+                             model_file=model_file, use_gpu=use_gpu,
+                             use_amp=False)
+        evaluator_use_gpu = bool(use_gpu and torch.cuda.is_available())
+        evaluator_fp16 = bool(evaluator_use_gpu and inference_fp16)
+        cuda_graph = None
+
+        def optimize_evaluator_model():
+            net.policy_value_net = net.policy_value_net.to(
+                memory_format=torch.channels_last)
+            if evaluator_fp16:
+                net.policy_value_net = net.policy_value_net.half()
+            net.policy_value_net.eval()
+
+        def capture_cuda_graph_or_none():
+            if not (evaluator_use_gpu and use_cuda_graphs):
+                return None
+            try:
+                graph_dtype = torch.float16 if evaluator_fp16 else torch.float32
+                graph = CudaGraphInferenceWrapper(
+                    net.policy_value_net,
+                    int(eval_batch_size),
+                    (int(in_channels), int(board_width), int(board_height)),
+                    net.device,
+                    dtype=graph_dtype,
+                )
+                print("[gpu-evaluator] CUDA Graph captured: batch_size={}, dtype={}".format(
+                    int(eval_batch_size), graph_dtype), flush=True)
+                return graph
+            except Exception as exc:
+                print("[gpu-evaluator] CUDA Graph capture failed; using eager inference: {}".format(
+                    exc), flush=True)
+                return None
+
+        def first_param_data_ptr():
+            try:
+                return next(net.policy_value_net.parameters()).data_ptr()
+            except StopIteration:
+                return None
+
+        optimize_evaluator_model()
+        if evaluator_use_gpu:
             print("[gpu-evaluator] GPU: {}".format(
                 torch.cuda.get_device_name(0)), flush=True)
+            print("[gpu-evaluator] inference optimizations: fp16={}, channels_last=True, cuda_graphs={}".format(
+                evaluator_fp16, bool(use_cuda_graphs)), flush=True)
+            cuda_graph = capture_cuda_graph_or_none()
+
+        if shm_in_name and shm_out_name:
+            shm_in = shared_memory.SharedMemory(name=shm_in_name)
+            shm_out = shared_memory.SharedMemory(name=shm_out_name)
+            shm_in_view = np.ndarray(
+                (int(shm_slots), int(in_channels), int(board_width), int(board_height)),
+                dtype=np.float32,
+                buffer=shm_in.buf,
+            )
+            shm_out_view = np.ndarray(
+                (int(shm_slots), board_size + 1),
+                dtype=np.float32,
+                buffer=shm_out.buf,
+            )
 
         pending = []
         stopping = False
         timeout_sec = max(0.001, float(eval_timeout_ms) / 1000.0)
 
-        while True:
+        while not stopping and not (shutdown_event is not None and shutdown_event.is_set()):
+            if weight_event is not None and weight_event.is_set():
+                try:
+                    old_ptr = first_param_data_ptr()
+                    state = torch.load(model_file, map_location=net.device)
+                    net.policy_value_net.load_state_dict(state)
+                    optimize_evaluator_model()
+                    new_ptr = first_param_data_ptr()
+                    if cuda_graph is not None and old_ptr != new_ptr:
+                        print("[gpu-evaluator] parameter data_ptr changed on reload; recapturing CUDA Graph", flush=True)
+                        cuda_graph = capture_cuda_graph_or_none()
+                    print("[gpu-evaluator] hot-reloaded weights from {}".format(
+                        model_file), flush=True)
+                except Exception as exc:
+                    print("[gpu-evaluator] reload failed: {}".format(exc), flush=True)
+                finally:
+                    weight_event.clear()
+
             if not pending and not stopping:
-                msg = request_queue.get()
-                if msg.get("type") == "stop":
+                try:
+                    msg = request_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if isinstance(msg, dict) and msg.get("type") in ("stop", "shutdown"):
                     break
                 pending.append(msg)
 
@@ -216,27 +486,44 @@ def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
                     msg = request_queue.get(timeout=remaining)
                 except queue.Empty:
                     break
-                if msg.get("type") == "stop":
+                if isinstance(msg, dict) and msg.get("type") in ("stop", "shutdown"):
                     stopping = True
                     break
                 pending.append(msg)
 
             if pending:
-                states = np.asarray([p["state"] for p in pending], dtype=np.float32)
-                act_probs_batch, value_batch = net.policy_value(states)
+                if shm_in_view is not None:
+                    states = np.asarray([shm_in_view[int(p[0])] for p in pending],
+                                        dtype=np.float32)
+                else:
+                    states = np.asarray([p["state"] for p in pending], dtype=np.float32)
+                if cuda_graph is not None:
+                    act_probs_batch, value_batch = cuda_graph.run(states)
+                else:
+                    act_probs_batch, value_batch = net.policy_value_inference(
+                        states,
+                        fp16=evaluator_fp16,
+                        channels_last=evaluator_use_gpu,
+                    )
                 bsz = len(pending)
                 total_requests += bsz
                 total_batches += 1
                 max_batch = max(max_batch, bsz)
 
                 for item, act_probs, value in zip(pending, act_probs_batch, value_batch):
-                    wid = int(item["worker_id"])
-                    response_queues[wid].put({
-                        "type": "eval_result",
-                        "request_id": item["request_id"],
-                        "act_probs": act_probs.astype(np.float32, copy=False),
-                        "value": float(np.asarray(value).reshape(-1)[0]),
-                    })
+                    if shm_out_view is not None:
+                        slot, wid, rid = int(item[0]), int(item[1]), int(item[2])
+                        shm_out_view[slot, :board_size] = act_probs.astype(np.float32, copy=False)
+                        shm_out_view[slot, board_size] = float(np.asarray(value).reshape(-1)[0])
+                        response_queues[wid].put((slot, rid))
+                    else:
+                        wid = int(item["worker_id"])
+                        response_queues[wid].put({
+                            "type": "eval_result",
+                            "request_id": item["request_id"],
+                            "act_probs": act_probs.astype(np.float32, copy=False),
+                            "value": float(np.asarray(value).reshape(-1)[0]),
+                        })
                 pending = []
 
                 if log_every_batches > 0 and total_batches % int(log_every_batches) == 0:
@@ -280,10 +567,20 @@ def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
             })
         except Exception:
             pass
+    finally:
+        shm_in_view = None
+        shm_out_view = None
+        if shm_in is not None:
+            shm_in.close()
+        if shm_out is not None:
+            shm_out.close()
 
 
-def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
+def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
+                           shutdown_event=None, slot_pool_queue=None,
+                           shm_in_name=None, shm_out_name=None, shm_slots=0):
     wid = int(args["worker_id"])
+    client = None
     try:
         set_cpu_threads(args.get("threads_per_worker", 1))
         seed = int(args.get("seed", 0)) + wid
@@ -293,7 +590,8 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
 
         bw = int(args["board_width"])
         bh = int(args["board_height"])
-        n_games = int(args["n_games"])
+        n_games = int(args.get("n_games", 1))
+        persistent = bool(args.get("persistent", False))
         n_playout = int(args["n_playout"])
         c_puct = float(args["c_puct"])
         temp = float(args["temp"])
@@ -322,6 +620,10 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
             response_queue=response_queue,
             response_timeout=float(args["response_timeout"]),
             log_every=int(args.get("worker_log_every", 2000)),
+            slot_pool_queue=slot_pool_queue,
+            shm_in_name=shm_in_name,
+            shm_out_name=shm_out_name,
+            shm_slots=shm_slots,
         )
         mcts_player = MCTSPlayer(client.policy_value_fn,
                                  client.policy_value_batch_fn,
@@ -333,10 +635,15 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
                                  n_vl=n_vl,
                                  max_oversample=max_oversample)
 
-        all_data = []
         episode_lens = []
+        all_data = []
         start = time.time()
-        for game_idx in range(n_games):
+        games_done = 0
+        while True:
+            if shutdown_event is not None and shutdown_event.is_set():
+                break
+            if not persistent and games_done >= n_games:
+                break
             t0 = time.time()
             winner, play_data = game.start_self_play(
                 mcts_player,
@@ -345,47 +652,72 @@ def selfplay_worker_remote(args, request_queue, response_queue, output_queue):
                 temp_high=temp_high,
                 temp_low=temp_low)
             play_data = list(play_data)
+            augmented = get_equi_data(play_data, bw, bh)
             episode_lens.append(len(play_data))
-            all_data.extend(get_equi_data(play_data, bw, bh))
-            print("[worker {}] game {}/{} done: winner={}, episode_len={}, eval_requests={}, {:.1f}s".format(
-                wid, game_idx + 1, n_games, winner, len(play_data),
+            games_done += 1
+            if persistent:
+                replay_item = {
+                    "ok": True,
+                    "worker_id": wid,
+                    "data": augmented,
+                    "episode_lens": [len(play_data)],
+                    "eval_requests": client.request_id,
+                    "elapsed": time.time() - start,
+                }
+                try:
+                    replay_queue.put(replay_item, timeout=10.0)
+                except queue.Full:
+                    print("[worker {}] replay queue full; dropping completed game".format(
+                        wid), flush=True)
+            else:
+                all_data.extend(augmented)
+            game_label = str(games_done) if persistent else "{}/{}".format(games_done, n_games)
+            print("[worker {}] game {} done: winner={}, episode_len={}, augmented_positions={}, eval_requests={}, {:.1f}s".format(
+                wid, game_label, winner, len(play_data), len(augmented),
                 client.request_id, time.time() - t0), flush=True)
-
-        output_queue.put({
-            "ok": True,
-            "worker_id": wid,
-            "data": all_data,
-            "episode_lens": episode_lens,
-            "eval_requests": client.request_id,
-            "elapsed": time.time() - start,
-        })
+        if not persistent:
+            replay_queue.put({
+                "ok": True,
+                "worker_id": wid,
+                "data": all_data,
+                "episode_lens": episode_lens,
+                "eval_requests": client.request_id,
+                "elapsed": time.time() - start,
+            })
     except Exception as exc:
         tb = traceback.format_exc()
         print("[worker {}] ERROR: {}\n{}".format(wid, exc, tb), flush=True)
-        output_queue.put({
-            "ok": False,
-            "worker_id": wid,
-            "error": str(exc),
-            "traceback": tb,
-            "data": [],
-            "episode_lens": [],
-            "eval_requests": 0,
-            "elapsed": 0.0,
-        })
+        try:
+            replay_queue.put({
+                "ok": False,
+                "worker_id": wid,
+                "error": str(exc),
+                "traceback": tb,
+                "data": [],
+                "episode_lens": [],
+                "eval_requests": getattr(client, "request_id", 0),
+                "elapsed": 0.0,
+            }, timeout=5.0)
+        except Exception:
+            pass
+    finally:
+        if client is not None:
+            client.close()
 
 
 class TrainPipeline(object):
     def __init__(self, init_model=None, use_gpu=True, num_workers=10,
                  games_per_worker=1, threads_per_worker=1, n_playout=800,
                  batch_size=512, game_batch_num=1500, check_freq=50,
-                 eval_games=10, eval_batch_size=128, eval_timeout_ms=8,
+                 eval_games=10, eval_batch_size=256, eval_timeout_ms=8,
                  response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
                  dirichlet_alpha=0.05, noise_eps=0.25,
                  vl_k=4, n_vl=1.0, max_oversample=3,
                  temperature_moves=8, temp_high=1.0, temp_low=1e-3,
                  buffer_size=500000, recent_sample_window=200000,
                  worker_model_file="./_tmp_gpu_evaluator_policy.model",
-                 batch_log_file="training_batches.log"):
+                 batch_log_file="training_batches.log",
+                 use_cuda_graphs=True, inference_fp16=True):
         self.use_gpu = bool(use_gpu)
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
@@ -401,7 +733,25 @@ class TrainPipeline(object):
         self.response_timeout = float(response_timeout)
         self.worker_model_file = worker_model_file
         self.batch_log_file = batch_log_file
+        self.use_cuda_graphs = bool(use_cuda_graphs)
+        self.inference_fp16 = bool(inference_fp16)
         self.last_update_metrics = None
+        self.ctx = None
+        self.request_queue = None
+        self.replay_queue = None
+        self.response_queues = None
+        self.stats_queue = None
+        self.weight_event = None
+        self.shutdown_event = None
+        self.slot_pool_queue = None
+        self.shm_in = None
+        self.shm_out = None
+        self.shm_slots = 0
+        self.shm_in_shape = None
+        self.shm_out_shape = None
+        self.evaluator_proc = None
+        self.worker_procs = []
+        self.pipeline_started = False
 
         self.board_width = 15
         self.board_height = 15
@@ -430,6 +780,7 @@ class TrainPipeline(object):
         self.epochs = 5
         self.kl_targ = 0.02
         self.global_update_count = 0
+        self.weight_push_every = 4
         self.lr_schedule = [
             (3000, 2e-3),
             (15000, 5e-4),
@@ -452,6 +803,138 @@ class TrainPipeline(object):
         for k, v in sd.items():
             cpu_sd[k] = v.detach().cpu() if hasattr(v, "detach") else v
         torch.save(cpu_sd, self.worker_model_file)
+
+    def setup_shared_memory(self):
+        board_size = self.board_width * self.board_height
+        in_channels = 4
+        self.shm_slots = max(1024, self.num_workers * self.vl_k * 4)
+        self.shm_in_shape = (self.shm_slots, in_channels,
+                             self.board_width, self.board_height)
+        self.shm_out_shape = (self.shm_slots, board_size + 1)
+        in_bytes = int(np.prod(self.shm_in_shape) * np.dtype(np.float32).itemsize)
+        out_bytes = int(np.prod(self.shm_out_shape) * np.dtype(np.float32).itemsize)
+        self.shm_in = shared_memory.SharedMemory(create=True, size=in_bytes)
+        self.shm_out = shared_memory.SharedMemory(create=True, size=out_bytes)
+        shm_in_view = np.ndarray(self.shm_in_shape, dtype=np.float32,
+                                 buffer=self.shm_in.buf)
+        shm_out_view = np.ndarray(self.shm_out_shape, dtype=np.float32,
+                                  buffer=self.shm_out.buf)
+        shm_in_view.fill(0.0)
+        shm_out_view.fill(0.0)
+        for slot in range(self.shm_slots):
+            self.slot_pool_queue.put(slot)
+        print("shared-memory IPC: slots={}, shm_in={} bytes, shm_out={} bytes".format(
+            self.shm_slots, in_bytes, out_bytes), flush=True)
+
+    def cleanup_shared_memory(self):
+        for attr in ("shm_in", "shm_out"):
+            shm = getattr(self, attr, None)
+            if shm is None:
+                continue
+            try:
+                shm.close()
+            except Exception:
+                pass
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                print("shared-memory cleanup warning for {}: {}".format(
+                    attr, exc), flush=True)
+            setattr(self, attr, None)
+
+    def start_async_pipeline(self):
+        if self.pipeline_started:
+            return
+        self.save_cpu_model_for_evaluator()
+        self.ctx = mp.get_context("spawn")
+        self.request_queue = self.ctx.Queue(maxsize=max(4096, self.num_workers * self.vl_k * 16))
+        self.response_queues = [self.ctx.Queue(maxsize=64) for _ in range(self.num_workers)]
+        self.replay_queue = self.ctx.Queue(maxsize=max(64, self.num_workers * 8))
+        self.stats_queue = self.ctx.Queue()
+        self.weight_event = self.ctx.Event()
+        self.shutdown_event = self.ctx.Event()
+        self.slot_pool_queue = self.ctx.Queue(maxsize=max(1024, self.num_workers * self.vl_k * 4))
+        self.setup_shared_memory()
+
+        self.evaluator_proc = self.ctx.Process(
+            target=gpu_evaluator_loop,
+            args=(
+                self.worker_model_file,
+                self.board_width,
+                self.board_height,
+                self.request_queue,
+                self.response_queues,
+                self.stats_queue,
+                self.eval_batch_size,
+                self.eval_timeout_ms,
+                self.use_gpu,
+                1,
+                200,
+                self.weight_event,
+                self.shutdown_event,
+                self.shm_in.name,
+                self.shm_out.name,
+                self.shm_slots,
+                4,
+                self.use_cuda_graphs,
+                self.inference_fp16,
+            ),
+            name="gpu-evaluator")
+        self.evaluator_proc.start()
+
+        self.worker_procs = []
+        for args in self.build_worker_args():
+            args = dict(args)
+            args["persistent"] = True
+            wid = int(args["worker_id"])
+            p = self.ctx.Process(
+                target=selfplay_worker_remote,
+                args=(
+                    args,
+                    self.request_queue,
+                    self.response_queues[wid],
+                    self.replay_queue,
+                    self.shutdown_event,
+                    self.slot_pool_queue,
+                    self.shm_in.name,
+                    self.shm_out.name,
+                    self.shm_slots,
+                ),
+                name="selfplay-worker-{}".format(wid))
+            p.start()
+            self.worker_procs.append(p)
+        self.pipeline_started = True
+        print("persistent remote-GPU self-play started: workers={}, n_playout={}, c_puct={}, dirichlet_alpha={}, noise_eps={}, vl_k={}, n_vl={}, max_oversample={}, temperature_moves={}, temp_high={}, temp_low={}, eval_batch_size={}, eval_timeout_ms={}".format(
+            self.num_workers, self.n_playout, self.c_puct,
+            self.dirichlet_alpha, self.noise_eps, self.vl_k, self.n_vl,
+            self.max_oversample, self.temperature_moves, self.temp_high,
+            self.temp_low, self.eval_batch_size, self.eval_timeout_ms),
+            flush=True)
+
+    def stop_async_pipeline(self):
+        if self.shutdown_event is not None:
+            self.shutdown_event.set()
+        if self.request_queue is not None:
+            try:
+                self.request_queue.put({"type": "shutdown"})
+            except Exception:
+                pass
+        for p in list(self.worker_procs):
+            p.join(timeout=30)
+            if p.is_alive():
+                print("terminating stuck worker {}".format(p.name), flush=True)
+                p.terminate()
+                p.join(timeout=10)
+        if self.evaluator_proc is not None:
+            self.evaluator_proc.join(timeout=60)
+            if self.evaluator_proc.is_alive():
+                print("terminating stuck GPU evaluator", flush=True)
+                self.evaluator_proc.terminate()
+                self.evaluator_proc.join(timeout=10)
+        self.cleanup_shared_memory()
+        self.pipeline_started = False
 
     def build_worker_args(self):
         base_seed = int(time.time() * 1000000) % (2 ** 31 - 1)
@@ -503,6 +986,14 @@ class TrainPipeline(object):
                 self.use_gpu,
                 1,
                 200,
+                None,
+                None,
+                None,
+                None,
+                0,
+                4,
+                self.use_cuda_graphs,
+                self.inference_fp16,
             ),
             name="gpu-evaluator")
 
@@ -607,6 +1098,52 @@ class TrainPipeline(object):
             total_games, self.episode_len, total_positions, total_eval_requests,
             max(worker_times) if worker_times else 0.0, len(self.data_buffer)),
             flush=True)
+
+    def drain_replay_queue(self, max_games=None, timeout=1.0):
+        max_games = max_games or max(1, self.num_workers * max(1, self.games_per_worker))
+        drained_games = 0
+        total_positions = 0
+        episode_lens = []
+        total_eval_requests = 0
+        worker_times = []
+        deadline = time.time() + float(timeout)
+        while drained_games < max_games:
+            remaining = max(0.0, deadline - time.time())
+            if drained_games > 0 and remaining <= 0:
+                break
+            try:
+                result = self.replay_queue.get(timeout=remaining if drained_games == 0 else 0.0)
+            except queue.Empty:
+                break
+            if not result.get("ok", False):
+                raise RuntimeError("worker {} failed: {}\n{}".format(
+                    result.get("worker_id"), result.get("error"),
+                    result.get("traceback")))
+            data = result.get("data", [])
+            self.data_buffer.extend(data)
+            episode_lens.extend(result.get("episode_lens", []))
+            total_positions += len(data)
+            total_eval_requests += int(result.get("eval_requests", 0))
+            worker_times.append(float(result.get("elapsed", 0.0)))
+            drained_games += len(result.get("episode_lens", [])) or 1
+        if episode_lens:
+            self.episode_len = float(np.mean(episode_lens))
+        return {
+            "games": int(drained_games),
+            "positions": int(total_positions),
+            "episode_len": float(getattr(self, "episode_len", 0.0)),
+            "eval_requests": int(total_eval_requests),
+            "slowest_worker_elapsed": max(worker_times) if worker_times else 0.0,
+        }
+
+    def check_async_processes(self):
+        if self.evaluator_proc is not None and not self.evaluator_proc.is_alive():
+            raise RuntimeError("GPU evaluator exited unexpectedly with exitcode={}".format(
+                self.evaluator_proc.exitcode))
+        dead = [p for p in self.worker_procs if not p.is_alive()]
+        if dead:
+            raise RuntimeError("self-play worker(s) exited unexpectedly: {}".format(
+                [(p.name, p.exitcode) for p in dead]))
 
     def get_scheduled_lr(self):
         for boundary, lr in self.lr_schedule:
@@ -718,27 +1255,49 @@ class TrainPipeline(object):
         return win_ratio
 
     def run(self):
+        self.start_async_pipeline()
         try:
-            for i in range(self.game_batch_num):
-                self.collect_selfplay_data_remote_gpu()
-                batch_no = i + 1
-                print("batch i:{}, data_buffer:{}".format(
-                    batch_no, len(self.data_buffer)), flush=True)
+            target_updates = self.game_batch_num
+            update_count = 0
+            loop_count = 0
+            last_save_update = 0
+            while update_count < target_updates:
+                self.check_async_processes()
+                loop_count += 1
+                replay_metrics = self.drain_replay_queue(
+                    max_games=max(1, self.num_workers * self.games_per_worker),
+                    timeout=10.0,
+                )
+                print("async loop:{}, updates:{}/{}, drained_games:{}, positions:{}, data_buffer:{}".format(
+                    loop_count, update_count, target_updates,
+                    replay_metrics["games"], replay_metrics["positions"],
+                    len(self.data_buffer)), flush=True)
                 update_metrics = None
                 if len(self.data_buffer) > self.batch_size:
                     self.policy_update()
+                    update_count += 1
                     update_metrics = self.last_update_metrics
+                    if update_count % self.weight_push_every == 0:
+                        self.save_cpu_model_for_evaluator()
+                        self.weight_event.set()
+                        print("signaled GPU evaluator weight reload at update {}".format(
+                            update_count), flush=True)
                     self.policy_value_net.save_model("./current_policy.model")
+                    last_save_update = update_count
                 self.append_batch_log({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "batch": int(batch_no),
+                    "batch": int(loop_count),
+                    "update": int(update_count),
                     "data_buffer": int(len(self.data_buffer)),
-                    "episode_len": float(getattr(self, "episode_len", 0.0)),
+                    "episode_len": float(replay_metrics["episode_len"]),
+                    "drained_games": int(replay_metrics["games"]),
+                    "drained_positions": int(replay_metrics["positions"]),
+                    "eval_requests": int(replay_metrics["eval_requests"]),
                     "updated": update_metrics is not None,
                     "update_metrics": update_metrics,
                 })
-                if batch_no % self.check_freq == 0:
-                    print("current self-play batch: {}".format(batch_no), flush=True)
+                if update_count > 0 and update_metrics is not None and update_count % self.check_freq == 0:
+                    print("current training update: {}".format(update_count), flush=True)
                     win_ratio = self.policy_evaluate(self.eval_games)
                     self.policy_value_net.save_model("./current_policy.model")
                     if win_ratio > self.best_win_ratio:
@@ -748,11 +1307,15 @@ class TrainPipeline(object):
                         if self.best_win_ratio == 1.0 and self.pure_mcts_playout_num < 5000:
                             self.pure_mcts_playout_num += 1000
                             self.best_win_ratio = 0.0
+            if last_save_update != update_count:
+                self.policy_value_net.save_model("./current_policy.model")
         except KeyboardInterrupt:
             print("\nInterrupted. Saving checkpoint...", flush=True)
             self.policy_value_net.save_model("./interrupt_policy.model")
             self.policy_value_net.save_model("./current_policy.model")
             print("Saved: interrupt_policy.model and current_policy.model", flush=True)
+        finally:
+            self.stop_async_pipeline()
 
 
 def parse_args():
@@ -783,9 +1346,13 @@ def parse_args():
     p.add_argument("--game-batch-num", type=int, default=1500)
     p.add_argument("--check-freq", type=int, default=50)
     p.add_argument("--eval-games", type=int, default=10)
-    p.add_argument("--eval-batch-size", type=int, default=128)
+    p.add_argument("--eval-batch-size", type=int, default=256)
     p.add_argument("--eval-timeout-ms", type=int, default=8)
     p.add_argument("--response-timeout", type=float, default=180.0)
+    p.add_argument("--disable-cuda-graphs", action="store_true",
+                   help="Disable evaluator CUDA Graph capture/replay.")
+    p.add_argument("--disable-inference-fp16", action="store_true",
+                   help="Disable evaluator FP16 + channels_last inference path.")
     p.add_argument("--batch-log-file", default="training_batches.log",
                    help="Path to append one JSON training summary per game batch. Use an empty string to disable.")
     return p.parse_args()
@@ -824,5 +1391,7 @@ if __name__ == "__main__":
         eval_timeout_ms=args.eval_timeout_ms,
         response_timeout=args.response_timeout,
         batch_log_file=args.batch_log_file,
+        use_cuda_graphs=not args.disable_cuda_graphs,
+        inference_fp16=not args.disable_inference_fp16,
     )
     pipeline.run()
