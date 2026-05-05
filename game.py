@@ -16,14 +16,20 @@ class Board(object):
         self.states = {}
         self.n_in_row = int(kwargs.get('n_in_row', 5))
         self.players = [1, 2]
+        self.availables = []
+        self._available_set = set()
+        self._available_pos = {}
 
     def init_board(self, start_player=0):
         if self.width < self.n_in_row or self.height < self.n_in_row:
             raise Exception('board width and height can not be '
                             'less than {}'.format(self.n_in_row))
         self.current_player = self.players[start_player]  # start player
-        # keep available moves in a list
+        # Keep available moves list-compatible for policy indexing, while
+        # maintaining a set and position map for O(1) remove/restore.
         self.availables = list(range(self.width * self.height))
+        self._available_set = set(self.availables)
+        self._available_pos = {move: idx for idx, move in enumerate(self.availables)}
         self.states = {}
         self.last_move = -1
 
@@ -64,8 +70,19 @@ class Board(object):
         return square_state[:, ::-1, :]
 
     def do_move(self, move):
+        if move not in self._available_set:
+            raise ValueError('move {} is not available'.format(move))
+
+        removed_index = self._available_pos[move]
+        last_available = self.availables[-1]
+
+        self.availables[removed_index] = last_available
+        self._available_pos[last_available] = removed_index
+        self.availables.pop()
+        del self._available_pos[move]
+        self._available_set.remove(move)
+
         self.states[move] = self.current_player
-        self.availables.remove(move)
         self.current_player = (
             self.players[0] if self.current_player == self.players[1]
             else self.players[1]
@@ -78,7 +95,7 @@ class Board(object):
         states = self.states
         n = self.n_in_row
 
-        moved = list(set(range(width * height)) - set(self.availables))
+        moved = list(states.keys())
         if len(moved) < self.n_in_row *2-1:
             return False, -1
 
