@@ -107,7 +107,7 @@ def set_cpu_threads(n=1):
 def get_equi_data(play_data, board_width, board_height):
     extend_data = []
     for state, mcts_prob, winner in play_data:
-        for i in [1, 2, 3, 4]:
+        for i in range(4):
             equi_state = np.array([np.rot90(s, i) for s in state])
             equi_mcts_prob = np.rot90(
                 mcts_prob.reshape(board_height, board_width), i
