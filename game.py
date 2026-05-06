@@ -86,7 +86,7 @@ class Board(object):
                             self.last_move % self.height] = 1.0
         if len(self.states) % 2 == 0:
             square_state[3][:, :] = 1.0  # indicate the colour to play
-        return square_state[:, ::-1, :]
+        return square_state
 
     def do_move(self, move):
         if move not in self._available_set:

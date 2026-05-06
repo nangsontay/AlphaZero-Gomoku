@@ -110,18 +110,18 @@ def get_equi_data(play_data, board_width, board_height):
         for i in [1, 2, 3, 4]:
             equi_state = np.array([np.rot90(s, i) for s in state])
             equi_mcts_prob = np.rot90(
-                np.flipud(mcts_prob.reshape(board_height, board_width)), i
+                mcts_prob.reshape(board_height, board_width), i
             )
             extend_data.append((
                 equi_state,
-                np.flipud(equi_mcts_prob).flatten(),
+                equi_mcts_prob.flatten(),
                 winner,
             ))
-            equi_state = np.array([np.fliplr(s) for s in equi_state])
-            equi_mcts_prob = np.fliplr(equi_mcts_prob)
+            equi_state_flip = np.array([np.fliplr(s) for s in equi_state])
+            equi_mcts_prob_flip = np.fliplr(equi_mcts_prob)
             extend_data.append((
-                equi_state,
-                np.flipud(equi_mcts_prob).flatten(),
+                equi_state_flip,
+                equi_mcts_prob_flip.flatten(),
                 winner,
             ))
     return extend_data
