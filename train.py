@@ -14,10 +14,7 @@ from collections import defaultdict, deque
 from game import Board, Game
 from mcts_pure import MCTSPlayer as MCTS_Pure
 from mcts_alphaZero import MCTSPlayer
-#from policy_value_net import PolicyValueNet  # Theano and Lasagne
-from policy_value_net_pytorch import PolicyValueNet  # Pytorch
-#from policy_value_net_tensorflow import PolicyValueNet # Tensorflow
-# from policy_value_net_keras import PolicyValueNet # Keras
+from policy_value_net_mlp import PolicyValueNet
 
 
 class TrainPipeline():
@@ -25,7 +22,8 @@ class TrainPipeline():
                  eval_n_playout=1600, c_puct=3.0,
                  dirichlet_alpha=0.05, noise_eps=0.25,
                  temperature_moves=8, temp_high=1.0, temp_low=1e-3,
-                 buffer_size=500000, recent_sample_window=200000):
+                 buffer_size=500000, recent_sample_window=200000,
+                 sym_loss=True):
         self.use_gpu = use_gpu
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError(
@@ -44,7 +42,7 @@ class TrainPipeline():
                            height=self.board_height,
                            n_in_row=self.n_in_row)
         self.game = Game(self.board) 
-        self.learn_rate = 2e-3
+        self.learn_rate = 5e-4
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.n_playout = int(n_playout)
@@ -57,31 +55,34 @@ class TrainPipeline():
         self.temp_low = float(temp_low)
         self.buffer_size = int(buffer_size)
         self.recent_sample_window = max(1, int(recent_sample_window))
-        self.batch_size = 512
+        self.batch_size = 1024
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
         self.epochs = 5
-        self.kl_targ = 0.02
+        self.kl_targ = 0.03
         self.global_update_count = 0
         self.lr_schedule = [
-            (3000, 2e-3),
-            (15000, 5e-4),
-            (40000, 1e-4),
-            (float("inf"), 2e-5),
+            (1500, 5e-4),
+            (8000, 2e-4),
+            (30000, 5e-5),
+            (float("inf"), 1e-5),
         ]
         self.check_freq = 50
         self.game_batch_num = 1500
         self.best_win_ratio = 0.0
         self.pure_mcts_playout_num = 2000
+        sym_loss_weight = 0.05 if sym_loss else 0.0
         if init_model:
             self.policy_value_net = PolicyValueNet(self.board_width,
                                                    self.board_height,
                                                    model_file=init_model,
-                                                   use_gpu=self.use_gpu)
+                                                   use_gpu=self.use_gpu,
+                                                   sym_loss_weight=sym_loss_weight)
         else:
             self.policy_value_net = PolicyValueNet(self.board_width,
                                                    self.board_height,
-                                                   use_gpu=self.use_gpu)
+                                                   use_gpu=self.use_gpu,
+                                                   sym_loss_weight=sym_loss_weight)
         self.mcts_player = MCTSPlayer(self.policy_value_net.policy_value_fn,
                                       c_puct=self.c_puct,
                                       n_playout=self.n_playout,
@@ -137,13 +138,25 @@ class TrainPipeline():
         mcts_probs_batch = [data[1] for data in mini_batch]
         winner_batch = [data[2] for data in mini_batch]
         self.learn_rate = self.get_scheduled_lr()
+
+        # Counter normalisation rule: warmup is anchored on
+        # `global_update_count` defined as "number of `train_step` invocations
+        # on the main trainer's network". This counter is a property of the
+        # trainer, NOT the worker count. Same convention applies in train_mp.py
+        # and train_gpu_evaluator.py.
+        warmup_steps = 500
+        if self.global_update_count < warmup_steps:
+            warmup_lr = self.learn_rate * (self.global_update_count + 1) / warmup_steps
+        else:
+            warmup_lr = self.learn_rate
+
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
         for i in range(self.epochs):
             loss, entropy = self.policy_value_net.train_step(
                     state_batch,
                     mcts_probs_batch,
                     winner_batch,
-                    self.learn_rate*self.lr_multiplier)
+                    warmup_lr*self.lr_multiplier)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                     np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)),
@@ -255,6 +268,8 @@ if __name__ == '__main__':
     parser.add_argument('--temp-low', type=float, default=1e-3)
     parser.add_argument('--buffer-size', type=int, default=500000)
     parser.add_argument('--recent-sample-window', type=int, default=200000)
+    parser.add_argument('--sym-loss', dest='sym_loss', action='store_true', default=True)
+    parser.add_argument('--no-sym-loss', dest='sym_loss', action='store_false')
     args = parser.parse_args()
 
     training_pipeline = TrainPipeline(init_model=args.init_model,
@@ -268,5 +283,6 @@ if __name__ == '__main__':
                                       temp_high=args.temp_high,
                                       temp_low=args.temp_low,
                                       buffer_size=args.buffer_size,
-                                      recent_sample_window=args.recent_sample_window)
+                                      recent_sample_window=args.recent_sample_window,
+                                      sym_loss=args.sym_loss)
     training_pipeline.run()

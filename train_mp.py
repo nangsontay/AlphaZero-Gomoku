@@ -37,7 +37,7 @@ import torch
 from game import Board, Game
 from mcts_pure import MCTSPlayer as MCTS_Pure
 from mcts_alphaZero import MCTSPlayer
-from policy_value_net_pytorch import PolicyValueNet
+from policy_value_net_mlp import PolicyValueNet
 
 
 def set_worker_thread_limits(num_threads=1):
@@ -216,7 +216,7 @@ class TrainPipeline(object):
         games_per_worker=1,
         threads_per_worker=1,
         n_playout=400,
-        batch_size=512,
+        batch_size=1024,
         game_batch_num=1500,
         check_freq=50,
         eval_games=10,
@@ -252,7 +252,7 @@ class TrainPipeline(object):
         )
         self.game = Game(self.board)
 
-        self.learn_rate = 2e-3
+        self.learn_rate = 5e-4
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.n_playout = int(n_playout)
@@ -268,7 +268,8 @@ class TrainPipeline(object):
         self.play_batch_size = self.num_workers * self.games_per_worker
 
         self.epochs = 5
-        self.kl_targ = 0.02
+        self.kl_targ = 0.03
+        self.global_update_count = 0
         self.check_freq = int(check_freq)
         self.game_batch_num = int(game_batch_num)
         self.eval_games = int(eval_games)
@@ -280,13 +281,15 @@ class TrainPipeline(object):
                 self.board_width,
                 self.board_height,
                 model_file=init_model,
-                use_gpu=self.use_gpu
+                use_gpu=self.use_gpu,
+                sym_loss_weight=0.05
             )
         else:
             self.policy_value_net = PolicyValueNet(
                 self.board_width,
                 self.board_height,
-                use_gpu=self.use_gpu
+                use_gpu=self.use_gpu,
+                sym_loss_weight=0.05
             )
 
         self.mcts_player = MCTSPlayer(
@@ -407,6 +410,17 @@ class TrainPipeline(object):
         mcts_probs_batch = [data[1] for data in mini_batch]
         winner_batch = [data[2] for data in mini_batch]
 
+        # Counter normalisation rule: warmup is anchored on
+        # `global_update_count` defined as "number of `train_step` invocations
+        # on the main trainer's network". This counter is a property of the
+        # trainer, NOT the worker count. Same convention applies in train.py
+        # and train_gpu_evaluator.py.
+        warmup_steps = 500
+        if self.global_update_count < warmup_steps:
+            warmup_lr = self.learn_rate * (self.global_update_count + 1) / warmup_steps
+        else:
+            warmup_lr = self.learn_rate
+
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
 
         for _ in range(self.epochs):
@@ -414,7 +428,7 @@ class TrainPipeline(object):
                 state_batch,
                 mcts_probs_batch,
                 winner_batch,
-                self.learn_rate * self.lr_multiplier
+                warmup_lr * self.lr_multiplier
             )
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(
@@ -431,6 +445,8 @@ class TrainPipeline(object):
             self.lr_multiplier /= 1.5
         elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
             self.lr_multiplier *= 1.5
+
+        self.global_update_count += 1
 
         winner_np = np.array(winner_batch)
         winner_var = np.var(winner_np)
@@ -564,7 +580,7 @@ def parse_args():
     parser.add_argument("--games-per-worker", type=int, default=1)
     parser.add_argument("--threads-per-worker", type=int, default=1)
     parser.add_argument("--n-playout", type=int, default=400)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--game-batch-num", type=int, default=1500)
     parser.add_argument("--check-freq", type=int, default=50)
     parser.add_argument("--eval-games", type=int, default=10)

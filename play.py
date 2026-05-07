@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import pickle
 import random
 import numpy as np
 import tkinter as tk
@@ -8,8 +7,7 @@ import torch
 from game import Board
 from mcts_alphaZero import MCTSPlayer
 from mcts_pure import MCTSPlayer as MCTS_Pure
-from policy_value_net_numpy import PolicyValueNetNumpy
-from policy_value_net_pytorch import PolicyValueNet
+from policy_value_net_mlp import PolicyValueNet
 
 class HumanPlayer(object):
     """
@@ -224,36 +222,53 @@ class GomokuGUI:
 
 def run():
     n = 5
-    width, height = 8, 8
+    width, height = 15, 15
     model_file = 'current_policy.model'
 
     best_policy = None
-    # Prefer PyTorch checkpoints (saved by train.py/train_mp.py).
     try:
         state_dict = torch.load(model_file, map_location="cpu")
         if isinstance(state_dict, dict):
-            if "act_fc1.weight" in state_dict:
-                board_size = state_dict["act_fc1.weight"].shape[0]
-                inferred = int(round(board_size ** 0.5))
-                if inferred * inferred == board_size:
+            if "policy_head.weight" in state_dict and \
+               "embed.proj.weight" in state_dict:
+                policy_out = int(state_dict["policy_head.weight"].shape[0])
+                inferred = int(round(policy_out ** 0.5))
+                # E08 guard: refuse non-square boards.
+                if inferred * inferred != policy_out:
+                    raise RuntimeError(
+                        f"Refusing to load '{model_file}': policy_head.weight "
+                        f"shape [{policy_out}, ...] is not a square; non-square "
+                        f"boards are not supported in this MLP build."
+                    )
+                # A12 consistency check: warn (and adopt) if checkpoint disagrees.
+                if inferred != width or inferred != height:
+                    print(
+                        f"WARNING: checkpoint board size {inferred}x{inferred} "
+                        f"does not match defaults {width}x{height}; adopting "
+                        f"checkpoint dimensions."
+                    )
                     width = height = inferred
-                best_policy = PolicyValueNet(width, height, model_file=model_file, use_gpu=False)
-            elif "value_fc1.weight" in state_dict:
-                board_size = state_dict["value_fc1.weight"].shape[1] // 4
-                inferred = int(round(board_size ** 0.5))
-                if inferred * inferred == board_size:
-                    width = height = inferred
-                best_policy = PolicyValueNet(width, height, model_file=model_file, use_gpu=False)
-    except Exception:
-        pass
+                best_policy = PolicyValueNet(
+                    width, height, model_file=model_file, use_gpu=False,
+                    search_d4_random=False,  # eval determinism (Cluster F / A16)
+                )
+            else:
+                print(
+                    "Refusing to load '{}': not a pure-MLP checkpoint. "
+                    "The no-CNN constraint forbids loading legacy CNN files."
+                    .format(model_file)
+                )
+    except Exception as exc:
+        print("Failed to inspect '{}': {}".format(model_file, exc))
 
-    # Backward-compatible path for old pickle/numpy checkpoints.
     if best_policy is None:
-        try:
-            policy_param = pickle.load(open(model_file, 'rb'))
-        except Exception:
-            policy_param = pickle.load(open(model_file, 'rb'), encoding='bytes')
-        best_policy = PolicyValueNetNumpy(width, height, policy_param)
+        # GATE-2 closed (2026-05-07): numpy fallback removed.
+        # E09 guard: explicit controlled failure instead of legacy pickle path.
+        raise RuntimeError(
+            f"Failed to load '{model_file}': not a pure-MLP checkpoint. "
+            f"The numpy CNN-shaped fallback was removed under the strict "
+            f"no-CNN reading (GATE-1=strict-everywhere, GATE-2=remove)."
+        )
 
     root = tk.Tk()
     root.title("Gomoku MCTS AlphaZero Evaluation")

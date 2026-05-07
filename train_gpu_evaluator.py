@@ -89,7 +89,7 @@ import torch
 from game import Board, Game
 from mcts_pure import MCTSPlayer as MCTS_Pure
 from mcts_alphaZero import MCTSPlayer
-from policy_value_net_pytorch import PolicyValueNet
+from policy_value_net_mlp import PolicyValueNet
 
 
 def set_cpu_threads(n=1):
@@ -901,7 +901,7 @@ class TrainPipeline(object):
         self.board = Board(width=self.board_width, height=self.board_height,
                            n_in_row=self.n_in_row)
         self.game = Game(self.board)
-        self.learn_rate = 2e-3
+        self.learn_rate = 5e-4
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.n_playout = int(n_playout)
@@ -921,14 +921,14 @@ class TrainPipeline(object):
         self.check_freq = max(1, int(check_freq))
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.epochs = 5
-        self.kl_targ = 0.02
+        self.kl_targ = 0.03
         self.global_update_count = 0
         self.weight_push_every = 4
         self.lr_schedule = [
-            (3000, 2e-3),
-            (15000, 5e-4),
-            (40000, 1e-4),
-            (float("inf"), 2e-5),
+            (1500, 5e-4),
+            (8000, 2e-4),
+            (30000, 5e-5),
+            (float("inf"), 1e-5),
         ]
         self.game_batch_num = int(game_batch_num)
         self.eval_games = int(eval_games)
@@ -937,7 +937,8 @@ class TrainPipeline(object):
 
         self.policy_value_net = PolicyValueNet(
             self.board_width, self.board_height,
-            model_file=init_model, use_gpu=self.use_gpu)
+            model_file=init_model, use_gpu=self.use_gpu,
+            sym_loss_weight=0.0)
 
     def save_cpu_model_for_evaluator(self):
         sd = self.policy_value_net.get_policy_param()
@@ -1409,6 +1410,18 @@ class TrainPipeline(object):
         winner_batch = [d[2] for d in mini_batch]
 
         self.learn_rate = self.get_scheduled_lr()
+
+        # Counter normalisation rule: warmup is anchored on
+        # `global_update_count` defined as "number of `train_step` invocations
+        # on the main trainer's network". This counter is a property of the
+        # trainer, NOT the worker count. Same convention applies in train.py
+        # and train_mp.py.
+        warmup_steps = 500
+        if self.global_update_count < warmup_steps:
+            warmup_lr = self.learn_rate * (self.global_update_count + 1) / warmup_steps
+        else:
+            warmup_lr = self.learn_rate
+
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
         kl = 0.0
         loss = 0.0
@@ -1417,7 +1430,7 @@ class TrainPipeline(object):
         for _ in range(self.epochs):
             loss, entropy = self.policy_value_net.train_step(
                 state_batch, mcts_probs_batch, winner_batch,
-                self.learn_rate * self.lr_multiplier)
+                warmup_lr * self.lr_multiplier)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                 np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)), axis=1))
