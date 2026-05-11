@@ -6,6 +6,8 @@
 from __future__ import print_function
 import numpy as np
 
+from tactic import get_tactic_label_vector
+
 
 class Board(object):
     """board for the game"""
@@ -239,9 +241,11 @@ class Game(object):
 
     def start_self_play(self, player, is_shown=0, temp=1e-3,
                         temperature_moves=None, temp_high=1.0,
-                        temp_low=1e-3):
+                        temp_low=1e-3, return_tactic_labels=False):
         """ start a self-play game using a MCTS player, reuse the search tree,
-        and store the self-play data: (state, mcts_probs, z) for training
+        and store the self-play data: (state, mcts_probs, z) for training.
+        If return_tactic_labels is true, return
+        (state, mcts_probs, z, tactic_label) samples.
 
         temp remains as the backward-compatible fixed-temperature path when
         temperature_moves is None. Pass temperature_moves=0 to use temp_low
@@ -250,7 +254,7 @@ class Game(object):
         """
         self.board.init_board()
         p1, p2 = self.board.players
-        states, mcts_probs, current_players = [], [], []
+        states, mcts_probs, current_players, tactic_labels = [], [], [], []
         move_idx = 0
         while True:
             cur_temp = temp
@@ -263,6 +267,8 @@ class Game(object):
             states.append(self.board.current_state().copy())
             mcts_probs.append(move_probs)
             current_players.append(self.board.current_player)
+            if return_tactic_labels:
+                tactic_labels.append(get_tactic_label_vector(self.board))
             # perform a move
             self.board.do_move(move)
             move_idx += 1
@@ -282,4 +288,7 @@ class Game(object):
                         print("Game end. Winner is player:", winner)
                     else:
                         print("Game end. Tie")
+                if return_tactic_labels:
+                    return winner, zip(states, mcts_probs, winners_z,
+                                       tactic_labels)
                 return winner, zip(states, mcts_probs, winners_z)

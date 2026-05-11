@@ -2,3 +2,8 @@
 __pycache__
 .idea
 _bmad-output
+_bmad
+.agents
+.claude
+.cursor
+.gitnexus

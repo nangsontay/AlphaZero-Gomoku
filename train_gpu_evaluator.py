@@ -818,7 +818,7 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                                  n_vl=n_vl,
                                   max_oversample=max_oversample,
                                   tactic_prior_weight=float(args.get(
-                                      "tactic_prior_weight", 0.35)))
+                                      "tactic_prior_weight", 0.0)))
 
         episode_lens = []
         all_data = []
@@ -835,7 +835,8 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                 temp=temp,
                 temperature_moves=temperature_moves,
                 temp_high=temp_high,
-                temp_low=temp_low)
+                temp_low=temp_low,
+                return_tactic_labels=True)
             play_data = list(play_data)
             augmented = get_equi_data(play_data, bw, bh)
             episode_lens.append(len(play_data))
@@ -924,7 +925,7 @@ class TrainPipeline(object):
                   tactic_pretrain_batch_size=256,
                   tactic_pretrain_lr=5e-4,
                   tactic_loss_weight=0.25,
-                  tactic_prior_weight=0.35):
+                  tactic_prior_weight=0.0):
         self.use_gpu = bool(use_gpu)
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
@@ -1788,9 +1789,9 @@ def parse_args():
     p.add_argument("--tactic-pretrain-batch-size", type=int, default=256)
     p.add_argument("--tactic-pretrain-lr", type=float, default=5e-4)
     p.add_argument("--tactic-loss-weight", type=float, default=0.25,
-                   help="Weight for auxiliary tactic BCE loss during policy updates. Use 0 to disable.")
-    p.add_argument("--tactic-prior-weight", type=float, default=0.35,
-                   help="Soft MCTS prior multiplier for tactical moves. Use 0 to disable.")
+                   help="Weight for auxiliary tactic BCE loss during policy updates. New self-play data carries B1 tactic labels; old 3-tuple replay still falls back to zero labels. Use 0 to disable.")
+    p.add_argument("--tactic-prior-weight", type=float, default=0.0,
+                   help="Soft MCTS prior multiplier for tactical moves. Default 0 disables P2 so tactics do not bias MCTS search.")
     p.add_argument("--batch-log-file", default="training_batches.log",
                    help="Path to append one JSON training summary per game batch. Use an empty string to disable.")
     return p.parse_args()
