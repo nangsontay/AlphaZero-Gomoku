@@ -184,8 +184,16 @@ class Game(object):
                     print('_'.center(8), end='')
             print('\r\n\r\n')
 
-    def start_play(self, player1, player2, start_player=0, is_shown=1):
-        """start a game between two players"""
+    def start_play(self, player1, player2, start_player=0, is_shown=1,
+                   move_log_prefix=None):
+        """start a game between two players
+
+        If move_log_prefix is a non-empty string, print a per-move progress line
+        (with elapsed time per move and cumulative time) prefixed with it. This
+        is useful for showing that long-running evaluation games are making
+        progress and not deadlocked.
+        """
+        import time as _time
         if start_player not in (0, 1):
             raise Exception('start_player should be either 0 (player1 first) '
                             'or 1 (player2 first)')
@@ -196,11 +204,28 @@ class Game(object):
         players = {p1: player1, p2: player2}
         if is_shown:
             self.graphic(self.board, player1.player, player2.player)
+        log_moves = bool(move_log_prefix)
+        game_start_t = _time.time() if log_moves else 0.0
+        move_idx = 0
         while True:
             current_player = self.board.get_current_player()
             player_in_turn = players[current_player]
+            move_start_t = _time.time() if log_moves else 0.0
             move = player_in_turn.get_action(self.board)
             self.board.do_move(move)
+            if log_moves:
+                move_idx += 1
+                move_elapsed = _time.time() - move_start_t
+                total_elapsed = _time.time() - game_start_t
+                player_name = type(player_in_turn).__module__ + "." + \
+                    type(player_in_turn).__name__
+                print(
+                    "{} move {:>3} by {} (player {}): action={}, "
+                    "move_elapsed={:.1f}s, total_elapsed={:.1f}s".format(
+                        move_log_prefix, move_idx, player_name,
+                        current_player, move, move_elapsed, total_elapsed),
+                    flush=True,
+                )
             if is_shown:
                 self.graphic(self.board, player1.player, player2.player)
             end, winner = self.board.game_end()

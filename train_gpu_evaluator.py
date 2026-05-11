@@ -853,7 +853,7 @@ class TrainPipeline(object):
                  games_per_worker=1, threads_per_worker=1, n_playout=800,
                  batch_size=512, game_batch_num=1500, check_freq=50,
                  eval_games=10, eval_batch_size=256, eval_timeout_ms=8,
-                 response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
+                 response_timeout=180.0, c_puct=3.0, eval_n_playout=400,
                  dirichlet_alpha=0.05, noise_eps=0.25,
                  vl_k=4, n_vl=1.0, max_oversample=3,
                  temperature_moves=8, temp_high=1.0, temp_low=1e-3,
@@ -934,7 +934,7 @@ class TrainPipeline(object):
         self.game_batch_num = int(game_batch_num)
         self.eval_games = int(eval_games)
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 2000
+        self.pure_mcts_playout_num = 400
 
         self.policy_value_net = PolicyValueNet(
             self.board_width, self.board_height,
@@ -1524,8 +1524,10 @@ class TrainPipeline(object):
         eval_start = time.time()
         for i in range(n_games):
             game_start = time.time()
+            move_log_prefix = "[eval game {}/{}]".format(i + 1, n_games)
             winner = self.game.start_play(current, pure, start_player=i % 2,
-                                          is_shown=0)
+                                          is_shown=0,
+                                          move_log_prefix=move_log_prefix)
             win_cnt[winner] += 1
             elapsed = time.time() - game_start
             total_elapsed = time.time() - eval_start
@@ -1644,7 +1646,7 @@ def parse_args():
     p.add_argument("--games-per-worker", type=int, default=1)
     p.add_argument("--threads-per-worker", type=int, default=1)
     p.add_argument("--n-playout", type=int, default=800)
-    p.add_argument("--eval-n-playout", type=int, default=1600)
+    p.add_argument("--eval-n-playout", type=int, default=400)
     p.add_argument("--c-puct", type=float, default=3.0)
     p.add_argument("--dirichlet-alpha", type=float, default=0.05)
     p.add_argument("--noise-eps", type=float, default=0.25)
