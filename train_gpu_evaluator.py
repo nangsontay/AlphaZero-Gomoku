@@ -19,6 +19,13 @@ import time
 import traceback
 from collections import defaultdict, deque
 from multiprocessing import resource_tracker, shared_memory
+import numpy as np
+import torch
+
+from game import Board, Game
+from mcts_pure import MCTSPlayer as MCTS_Pure
+from mcts_alphaZero import MCTSPlayer
+from policy_value_net_mlp import PolicyValueNet
 
 
 class _ShuttingDown(Exception):
@@ -83,13 +90,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-import numpy as np
-import torch
 
-from game import Board, Game
-from mcts_pure import MCTSPlayer as MCTS_Pure
-from mcts_alphaZero import MCTSPlayer
-from policy_value_net_mlp import PolicyValueNet
 
 
 def set_cpu_threads(n=1):
