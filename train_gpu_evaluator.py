@@ -1665,7 +1665,7 @@ def parse_args():
     p.add_argument("--game-batch-num", type=int, default=1500)
     p.add_argument("--check-freq", type=int, default=50,
                    help="Run policy evaluation every N training updates.")
-    p.add_argument("--eval-games", type=int, default=10)
+    p.add_argument("--eval-games", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=256)
     p.add_argument("--eval-timeout-ms", type=int, default=8)
     p.add_argument("--response-timeout", type=float, default=180.0)
