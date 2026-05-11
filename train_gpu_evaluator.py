@@ -26,6 +26,7 @@ from game import Board, Game
 from mcts_pure import MCTSPlayer as MCTS_Pure
 from mcts_alphaZero import MCTSPlayer
 from policy_value_net_mlp import PolicyValueNet
+from tactic import get_tactic_label_vector
 
 
 class _ShuttingDown(Exception):
@@ -107,25 +108,80 @@ def set_cpu_threads(n=1):
 
 def get_equi_data(play_data, board_width, board_height):
     extend_data = []
-    for state, mcts_prob, winner in play_data:
+    for sample in play_data:
+        state, mcts_prob, winner = sample[:3]
+        tactic_label = sample[3] if len(sample) > 3 else None
         for i in range(4):
             equi_state = np.array([np.rot90(s, i) for s in state])
             equi_mcts_prob = np.rot90(
                 mcts_prob.reshape(board_height, board_width), i
             )
-            extend_data.append((
-                equi_state,
-                equi_mcts_prob.flatten(),
-                winner,
-            ))
+            if tactic_label is None:
+                extend_data.append((
+                    equi_state,
+                    equi_mcts_prob.flatten(),
+                    winner,
+                ))
+            else:
+                equi_tactic = np.rot90(
+                    tactic_label.reshape(board_height, board_width), i
+                )
+                extend_data.append((
+                    equi_state,
+                    equi_mcts_prob.flatten(),
+                    winner,
+                    equi_tactic.flatten(),
+                ))
             equi_state_flip = np.array([np.fliplr(s) for s in equi_state])
             equi_mcts_prob_flip = np.fliplr(equi_mcts_prob)
-            extend_data.append((
-                equi_state_flip,
-                equi_mcts_prob_flip.flatten(),
-                winner,
-            ))
+            if tactic_label is None:
+                extend_data.append((
+                    equi_state_flip,
+                    equi_mcts_prob_flip.flatten(),
+                    winner,
+                ))
+            else:
+                equi_tactic_flip = np.fliplr(equi_tactic)
+                extend_data.append((
+                    equi_state_flip,
+                    equi_mcts_prob_flip.flatten(),
+                    winner,
+                    equi_tactic_flip.flatten(),
+                ))
     return extend_data
+
+
+def generate_tactical_samples(board_width=15, board_height=15, n_in_row=5,
+                              num_samples=2048, max_random_moves=36,
+                              seed=None):
+    """Generate lightweight tactical states and labels from random legal boards."""
+    rng = random.Random(seed)
+    samples = []
+    attempts = 0
+    max_attempts = max(int(num_samples) * 20, 100)
+    while len(samples) < int(num_samples) and attempts < max_attempts:
+        attempts += 1
+        board = Board(width=board_width, height=board_height, n_in_row=n_in_row)
+        board.init_board(start_player=rng.randrange(2))
+        move_count = rng.randint(max(0, n_in_row - 2), max(0, int(max_random_moves)))
+        for _ in range(move_count):
+            if not board.availables:
+                break
+            move = rng.choice(board.availables)
+            board.do_move(move)
+            end, _ = board.game_end()
+            if end:
+                break
+        end, _ = board.game_end()
+        if end or not board.availables:
+            continue
+        tactic_label = get_tactic_label_vector(board)
+        if float(tactic_label.max()) <= 0.0:
+            continue
+        state = board.current_state().copy().astype(np.float32)
+        dummy_policy = np.zeros(board_width * board_height, dtype=np.float32)
+        samples.append((state, dummy_policy, 0.0, tactic_label))
+    return get_equi_data(samples, board_width, board_height)
 
 
 class RemotePolicyValueClient(object):
@@ -440,7 +496,7 @@ class CudaGraphInferenceWrapper(object):
         self.graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(self.graph):
-                self.static_log_p, self.static_v = self.model(self.static_in)
+                self.static_log_p, self.static_v, _ = self.model(self.static_in)
 
     def run(self, batch_np):
         batch_np = np.ascontiguousarray(batch_np, dtype=np.float32)
@@ -760,7 +816,9 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                                  noise_eps=noise_eps,
                                  vl_k=vl_k,
                                  n_vl=n_vl,
-                                 max_oversample=max_oversample)
+                                  max_oversample=max_oversample,
+                                  tactic_prior_weight=float(args.get(
+                                      "tactic_prior_weight", 0.35)))
 
         episode_lens = []
         all_data = []
@@ -857,10 +915,16 @@ class TrainPipeline(object):
                  dirichlet_alpha=0.05, noise_eps=0.25,
                  vl_k=4, n_vl=1.0, max_oversample=3,
                  temperature_moves=8, temp_high=1.0, temp_low=1e-3,
-                 buffer_size=500000, recent_sample_window=200000,
-                 worker_model_file="./_tmp_gpu_evaluator_policy.model",
-                 batch_log_file="training_batches.log",
-                 use_cuda_graphs=True, inference_fp16=True):
+                  buffer_size=500000, recent_sample_window=200000,
+                  worker_model_file="./_tmp_gpu_evaluator_policy.model",
+                  batch_log_file="training_batches.log",
+                  use_cuda_graphs=True, inference_fp16=True,
+                  tactic_pretrain_steps=100,
+                  tactic_pretrain_samples=2048,
+                  tactic_pretrain_batch_size=256,
+                  tactic_pretrain_lr=5e-4,
+                  tactic_loss_weight=0.25,
+                  tactic_prior_weight=0.35):
         self.use_gpu = bool(use_gpu)
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
@@ -878,6 +942,12 @@ class TrainPipeline(object):
         self.batch_log_file = batch_log_file
         self.use_cuda_graphs = bool(use_cuda_graphs)
         self.inference_fp16 = bool(inference_fp16)
+        self.tactic_pretrain_steps = max(0, int(tactic_pretrain_steps))
+        self.tactic_pretrain_samples = max(0, int(tactic_pretrain_samples))
+        self.tactic_pretrain_batch_size = max(1, int(tactic_pretrain_batch_size))
+        self.tactic_pretrain_lr = float(tactic_pretrain_lr)
+        self.tactic_loss_weight = max(0.0, float(tactic_loss_weight))
+        self.tactic_prior_weight = max(0.0, float(tactic_prior_weight))
         self.last_update_metrics = None
         self.ctx = None
         self.request_queue = None
@@ -939,7 +1009,38 @@ class TrainPipeline(object):
         self.policy_value_net = PolicyValueNet(
             self.board_width, self.board_height,
             model_file=init_model, use_gpu=self.use_gpu,
-            sym_loss_weight=0.0)
+            sym_loss_weight=0.0,
+            tactic_loss_weight=self.tactic_loss_weight)
+
+    def tactical_pretrain(self):
+        """Run optional supervised pretraining for the auxiliary tactic head."""
+        if self.tactic_pretrain_steps <= 0 or self.tactic_pretrain_samples <= 0:
+            print("tactical pretraining disabled", flush=True)
+            return
+        print("tactical pretraining: samples={}, steps={}, batch_size={}, lr={:.6g}".format(
+            self.tactic_pretrain_samples, self.tactic_pretrain_steps,
+            self.tactic_pretrain_batch_size, self.tactic_pretrain_lr), flush=True)
+        data = generate_tactical_samples(
+            self.board_width, self.board_height, self.n_in_row,
+            num_samples=self.tactic_pretrain_samples,
+            seed=int(time.time()) % (2 ** 31 - 1))
+        if not data:
+            print("tactical pretraining skipped: no tactical samples generated", flush=True)
+            return
+        losses = []
+        for step in range(self.tactic_pretrain_steps):
+            batch_size = min(self.tactic_pretrain_batch_size, len(data))
+            mini_batch = random.sample(data, batch_size)
+            state_batch = [d[0] for d in mini_batch]
+            tactic_batch = [d[3] for d in mini_batch]
+            loss = self.policy_value_net.tactic_train_step(
+                state_batch, tactic_batch, self.tactic_pretrain_lr)
+            losses.append(float(loss))
+            if (step + 1) % max(1, self.tactic_pretrain_steps // 5) == 0:
+                print("tactical pretrain step {}/{}: loss={:.6f}".format(
+                    step + 1, self.tactic_pretrain_steps, float(loss)), flush=True)
+        print("tactical pretraining done: generated_positions={}, mean_loss={:.6f}".format(
+            len(data), float(np.nanmean(losses)) if losses else 0.0), flush=True)
 
     def save_cpu_model_for_evaluator(self):
         sd = self.policy_value_net.get_policy_param()
@@ -1205,6 +1306,7 @@ class TrainPipeline(object):
                 "vl_k": self.vl_k,
                 "n_vl": self.n_vl,
                 "max_oversample": self.max_oversample,
+                "tactic_prior_weight": self.tactic_prior_weight,
                 "temperature_moves": self.temperature_moves,
                 "temp_high": self.temp_high,
                 "temp_low": self.temp_low,
@@ -1409,6 +1511,9 @@ class TrainPipeline(object):
         state_batch = [d[0] for d in mini_batch]
         mcts_probs_batch = [d[1] for d in mini_batch]
         winner_batch = [d[2] for d in mini_batch]
+        tactic_batch = [d[3] if len(d) > 3 else np.zeros(
+            self.board_width * self.board_height, dtype=np.float32)
+            for d in mini_batch]
 
         self.learn_rate = self.get_scheduled_lr()
 
@@ -1431,7 +1536,8 @@ class TrainPipeline(object):
         for _ in range(self.epochs):
             loss, entropy = self.policy_value_net.train_step(
                 state_batch, mcts_probs_batch, winner_batch,
-                warmup_lr * self.lr_multiplier)
+                warmup_lr * self.lr_multiplier,
+                tactic_batch=tactic_batch)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                 np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)), axis=1))
@@ -1516,9 +1622,10 @@ class TrainPipeline(object):
                              policy_value_batch_fn,
                              c_puct=self.c_puct,
                              n_playout=self.eval_n_playout,
-                             vl_k=self.vl_k,
-                             n_vl=self.n_vl,
-                             max_oversample=self.max_oversample)
+                              vl_k=self.vl_k,
+                              n_vl=self.n_vl,
+                              max_oversample=self.max_oversample,
+                              tactic_prior_weight=self.tactic_prior_weight)
         pure = MCTS_Pure(c_puct=5, n_playout=self.pure_mcts_playout_num)
         win_cnt = defaultdict(int)
         eval_start = time.time()
@@ -1551,6 +1658,7 @@ class TrainPipeline(object):
         return win_ratio
 
     def run(self):
+        self.tactical_pretrain()
         self.start_async_pipeline()
         try:
             target_updates = self.game_batch_num
@@ -1673,6 +1781,16 @@ def parse_args():
                    help="Disable evaluator CUDA Graph capture/replay.")
     p.add_argument("--disable-inference-fp16", action="store_true",
                    help="Disable evaluator FP16 + channels_last inference path.")
+    p.add_argument("--tactic-pretrain-steps", type=int, default=100,
+                   help="Auxiliary tactic-head pretraining steps before self-play. Use 0 to disable.")
+    p.add_argument("--tactic-pretrain-samples", type=int, default=2048,
+                   help="Number of generated tactical base samples before D4 augmentation.")
+    p.add_argument("--tactic-pretrain-batch-size", type=int, default=256)
+    p.add_argument("--tactic-pretrain-lr", type=float, default=5e-4)
+    p.add_argument("--tactic-loss-weight", type=float, default=0.25,
+                   help="Weight for auxiliary tactic BCE loss during policy updates. Use 0 to disable.")
+    p.add_argument("--tactic-prior-weight", type=float, default=0.35,
+                   help="Soft MCTS prior multiplier for tactical moves. Use 0 to disable.")
     p.add_argument("--batch-log-file", default="training_batches.log",
                    help="Path to append one JSON training summary per game batch. Use an empty string to disable.")
     return p.parse_args()
@@ -1713,5 +1831,11 @@ if __name__ == "__main__":
         batch_log_file=args.batch_log_file,
         use_cuda_graphs=not args.disable_cuda_graphs,
         inference_fp16=not args.disable_inference_fp16,
+        tactic_pretrain_steps=args.tactic_pretrain_steps,
+        tactic_pretrain_samples=args.tactic_pretrain_samples,
+        tactic_pretrain_batch_size=args.tactic_pretrain_batch_size,
+        tactic_pretrain_lr=args.tactic_pretrain_lr,
+        tactic_loss_weight=args.tactic_loss_weight,
+        tactic_prior_weight=args.tactic_prior_weight,
     )
     pipeline.run()

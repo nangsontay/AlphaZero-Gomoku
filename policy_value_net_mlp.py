@@ -22,7 +22,7 @@ import numpy as np
 from contextlib import nullcontext
 
 # v2 addition (§3.6): module-level architecture version.
-MLP_ARCH_VERSION = "1.0.0"
+MLP_ARCH_VERSION = "1.1.0-tactic"
 
 
 def set_learning_rate(optimizer, lr):
@@ -140,6 +140,7 @@ class MLPNet(nn.Module):
         self.head_norm = Norm(self.hidden_dim)
 
         self.policy_head = nn.Linear(self.hidden_dim, self.board_size)
+        self.tactic_head = nn.Linear(self.hidden_dim, self.board_size)
 
         self.value_fc1 = nn.Linear(self.hidden_dim, self.value_hidden)
         self.value_act = Act()
@@ -168,8 +169,9 @@ class MLPNet(nn.Module):
         # Cast logits to float32 BEFORE log_softmax so AMP/FP16 paths stay
         # numerically stable.
         log_p = F.log_softmax(self.policy_head(x).float(), dim=1)   # (N, 225)
+        tactic_logits = self.tactic_head(x).float()                 # (N, 225)
         v = torch.tanh(self.value_fc2(self.value_act(self.value_fc1(x))))
-        return log_p, v
+        return log_p, v, tactic_logits
 
 
 class PolicyValueNet:
@@ -180,7 +182,8 @@ class PolicyValueNet:
                  # MLP-specific knobs (callers may ignore them):
                  embed_dim=32, hidden_dim=1536, num_blocks=6,
                  value_hidden=256, dropout=0.1, norm="ln", act="gelu",
-                 use_amp=None, sym_loss_weight=0.0,
+                  use_amp=None, sym_loss_weight=0.0,
+                  tactic_loss_weight=0.25,
                  # v2 addition (§5): control random D4 in policy_value_fn.
                  search_d4_random=True,
                  # CNN knobs accepted-and-ignored for backward-compat:
@@ -196,6 +199,7 @@ class PolicyValueNet:
         self.grad_clip_norm = 1.0
         self.use_amp = bool(self.use_gpu if use_amp is None else use_amp)
         self.sym_loss_weight = float(sym_loss_weight)
+        self.tactic_loss_weight = float(tactic_loss_weight)
         self.search_d4_random = bool(search_d4_random)
 
         self.policy_value_net = MLPNet(
@@ -230,7 +234,17 @@ class PolicyValueNet:
                                 if k != "state_dict"):
                 net_params = net_params["state_dict"]
             try:
-                self.policy_value_net.load_state_dict(net_params)
+                missing, unexpected = self.policy_value_net.load_state_dict(
+                    net_params, strict=False)
+                allowed_missing = {"tactic_head.weight", "tactic_head.bias"}
+                real_missing = [k for k in missing if k not in allowed_missing]
+                if real_missing or unexpected:
+                    raise RuntimeError(
+                        "missing keys: {}, unexpected keys: {}".format(
+                            real_missing, list(unexpected)))
+                if missing:
+                    print("[mlp] initialized new tactic head while loading legacy checkpoint: {}".format(
+                        ", ".join(missing)), flush=True)
             except RuntimeError as exc:
                 raise RuntimeError(
                     "Incompatible MLP checkpoint. The file at '{}' does not "
@@ -277,6 +291,10 @@ class PolicyValueNet:
             meta = json.load(f)
         ver = meta.get("MLP_ARCH_VERSION")
         if ver != MLP_ARCH_VERSION:
+            if ver == "1.0.0":
+                print(f"[mlp] WARNING: loading legacy MLP sidecar version '{ver}' "
+                      f"with newly initialized tactic head.", flush=True)
+                return
             raise RuntimeError(
                 f"MLP_ARCH_VERSION mismatch: checkpoint='{ver}' "
                 f"vs running='{MLP_ARCH_VERSION}'. Refusing to load."
@@ -314,7 +332,7 @@ class PolicyValueNet:
 
         with torch.no_grad():
             with self._autocast_context():
-                log_act_probs, value = self.policy_value_net(state_batch)
+                log_act_probs, value, _ = self.policy_value_net(state_batch)
 
         act_probs = torch.exp(log_act_probs).detach().cpu().numpy()
         value = value.detach().cpu().numpy()
@@ -342,7 +360,7 @@ class PolicyValueNet:
             # evaluator's call site does not need to change.
             state_tensor = state_tensor.to(memory_format=torch.channels_last)
         with torch.no_grad():
-            log_act_probs, value = self.policy_value_net(state_tensor)
+            log_act_probs, value, _ = self.policy_value_net(state_tensor)
         act_probs = torch.exp(log_act_probs.float()).detach().cpu().numpy()
         value = value.float().detach().cpu().numpy()
         return act_probs, value
@@ -367,7 +385,7 @@ class PolicyValueNet:
             state_tensor = torch.from_numpy(state).to(self.device)
             with torch.no_grad():
                 with self._autocast_context():
-                    _, v = self.policy_value_net(state_tensor)
+                    _, v, _ = self.policy_value_net(state_tensor)
             return iter([]), float(v.detach().cpu().numpy()[0][0])
 
         if self.search_d4_random:
@@ -380,7 +398,7 @@ class PolicyValueNet:
         state_tensor = torch.from_numpy(state).to(self.device)
         with torch.no_grad():
             with self._autocast_context():
-                log_p, v = self.policy_value_net(state_tensor)
+                log_p, v, _ = self.policy_value_net(state_tensor)
         act_probs = torch.exp(log_p).detach().cpu().numpy().flatten()
         value = float(v.detach().cpu().numpy()[0][0])
 
@@ -393,21 +411,29 @@ class PolicyValueNet:
         act_probs = zip(legal_positions, act_probs[legal_positions])
         return act_probs, value
 
-    def train_step(self, state_batch, mcts_probs, winner_batch, lr):
+    def train_step(self, state_batch, mcts_probs, winner_batch, lr,
+                   tactic_batch=None):
         """perform a training step (v2 §3.4 with E04 finite-loss guard)."""
         self.policy_value_net.train()
         state_batch = self._to_tensor(state_batch)
         mcts_probs = self._to_tensor(mcts_probs)
         winner_batch = self._to_tensor(winner_batch)
+        tactic_targets = None
+        if tactic_batch is not None:
+            tactic_targets = self._to_tensor(tactic_batch)
 
         self.optimizer.zero_grad(set_to_none=True)
         set_learning_rate(self.optimizer, lr)
 
         with self._autocast_context():
-            log_p, v = self.policy_value_net(state_batch)
+            log_p, v, tactic_logits = self.policy_value_net(state_batch)
             value_loss = F.mse_loss(v.view(-1), winner_batch)
             policy_loss = -torch.mean(torch.sum(mcts_probs * log_p, dim=1))
             loss = value_loss + policy_loss
+            if tactic_targets is not None and self.tactic_loss_weight > 0.0:
+                tactic_loss = F.binary_cross_entropy_with_logits(
+                    tactic_logits, tactic_targets)
+                loss = loss + self.tactic_loss_weight * tactic_loss
 
             # Optional symmetry regularisation (see §6).
             if self.sym_loss_weight > 0.0:
@@ -441,6 +467,40 @@ class PolicyValueNet:
         )
         return loss.item(), entropy.item()
 
+    def tactic_train_step(self, state_batch, tactic_batch, lr):
+        """Train only the auxiliary tactic objective on generated tactic labels."""
+        self.policy_value_net.train()
+        state_batch = self._to_tensor(state_batch)
+        tactic_targets = self._to_tensor(tactic_batch)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        set_learning_rate(self.optimizer, lr)
+
+        with self._autocast_context():
+            _, _, tactic_logits = self.policy_value_net(state_batch)
+            loss = F.binary_cross_entropy_with_logits(
+                tactic_logits, tactic_targets)
+
+        if not torch.isfinite(loss):
+            self.optimizer.zero_grad(set_to_none=True)
+            return float("nan")
+
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(
+                self.policy_value_net.parameters(), self.grad_clip_norm
+            )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(
+                self.policy_value_net.parameters(), self.grad_clip_norm
+            )
+            self.optimizer.step()
+        return loss.item()
+
     def _sym_loss(self, state_batch, log_p_orig):
         """Symmetry regularisation. state_batch: (N, 4, 15, 15) on self.device.
 
@@ -464,7 +524,7 @@ class PolicyValueNet:
         if do_flip:
             s = torch.flip(s, dims=(3,))
 
-        log_p_d4, _ = self.policy_value_net(s)
+        log_p_d4, _, _ = self.policy_value_net(s)
 
         p_orig = torch.exp(log_p_orig).detach().view(
             -1, self.board_height, self.board_width

@@ -6,6 +6,8 @@ network to guide the tree search and evaluate the leaf nodes
 
 import numpy as np
 
+from tactic import apply_tactical_prior_bonus
+
 
 def softmax(x):
     probs = np.exp(x - np.max(x))
@@ -179,8 +181,8 @@ class MCTS(object):
     """An implementation of Monte Carlo Tree Search."""
 
     def __init__(self, policy_value_fn, policy_value_batch_fn=None,
-                 c_puct=3.0, n_playout=10000, vl_k=4, n_vl=1.0,
-                 max_oversample=3):
+                  c_puct=3.0, n_playout=10000, vl_k=4, n_vl=1.0,
+                  max_oversample=3, tactic_prior_weight=0.35):
         """
         policy_value_fn: a function that takes in a board state and outputs
             a list of (action, probability) tuples and also a score in [-1, 1]
@@ -200,6 +202,7 @@ class MCTS(object):
         self._vl_k = max(1, int(vl_k))
         self._n_vl = float(n_vl)
         self._max_oversample = max(1, int(max_oversample))
+        self._tactic_prior_weight = max(0.0, float(tactic_prior_weight))
         self._root_noise_applied = False
 
     def _playout(self, state):
@@ -269,7 +272,7 @@ class MCTS(object):
                 for (leaf, sim, path), (action_priors, value) in zip(
                         nn_leaves, eval_results):
                     if leaf.is_leaf():
-                        leaf.expand(action_priors)
+                        leaf.expand(self._with_tactical_prior(action_priors, sim))
                         if (leaf.is_root() and dirichlet_alpha is not None and
                                 noise_eps > 0 and not self._root_noise_applied):
                             leaf.apply_dirichlet_noise(dirichlet_alpha, noise_eps)
@@ -311,6 +314,11 @@ class MCTS(object):
             results.append(([(a, float(priors[a])) for a in legal], float(value)))
         return results
 
+    def _with_tactical_prior(self, action_priors, board):
+        """Apply a soft tactical prior bonus before node expansion."""
+        return apply_tactical_prior_bonus(
+            action_priors, board, bonus_weight=self._tactic_prior_weight)
+
     def _backup_and_revert(self, path, leaf_value):
         """Revert virtual loss and back up values along a selected path."""
         if not path:
@@ -344,16 +352,18 @@ class MCTSPlayer(object):
     """AI player based on MCTS"""
 
     def __init__(self, policy_value_function, policy_value_batch_function=None,
-                 c_puct=3.0, n_playout=2000, is_selfplay=0,
-                 dirichlet_alpha=0.05, noise_eps=0.25,
-                 vl_k=4, n_vl=1.0, max_oversample=3):
+                  c_puct=3.0, n_playout=2000, is_selfplay=0,
+                  dirichlet_alpha=0.05, noise_eps=0.25,
+                  vl_k=4, n_vl=1.0, max_oversample=3,
+                  tactic_prior_weight=0.35):
         self.mcts = MCTS(policy_value_function,
                          policy_value_batch_fn=policy_value_batch_function,
                          c_puct=c_puct,
                          n_playout=n_playout,
-                         vl_k=vl_k,
-                         n_vl=n_vl,
-                         max_oversample=max_oversample)
+                          vl_k=vl_k,
+                          n_vl=n_vl,
+                          max_oversample=max_oversample,
+                          tactic_prior_weight=tactic_prior_weight)
         self._is_selfplay = is_selfplay
         self._dirichlet_alpha = float(dirichlet_alpha)
         self._noise_eps = float(noise_eps)
