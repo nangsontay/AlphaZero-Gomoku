@@ -203,45 +203,19 @@ class MCTS(object):
         self._root_noise_applied = False
 
     def _playout(self, state):
-        node = self._root
-        while(1):
-            if node.is_leaf():
-                break
-            # Tham lam chọn nước đi theo PUCT
-            action, node = node.select(self._c_puct)
-            state.do_move(action)
-
-        # ĐÁNH GIÁ TẠI LEAF NODE:
-        # TÍCH HỢP TACTIC HEURISTICS TRƯỚC KHI GỌI NEURAL NET
-        from tactic import get_tactic_forced_move
-        forced_move, is_win = get_tactic_forced_move(state)
-
-        if forced_move is not None:
-            # AI phát hiện ra đòn chiến thuật chí mạng
-            action_probs = [(forced_move, 1.0)]
-            # Nếu là nước thắng của mình thì leaf_value = 1.0, chặn thì trung lập 0.0
-            leaf_value = 1.0 if is_win else 0.0 
-            
-            end, winner = state.game_end()
-            if not end:
-                node.expand(action_probs)
-            else:
-                leaf_value = 1.0 if winner == state.current_player else -1.0
-        else:
-            # Trạng thái an toàn, gọi Neural Network bình thường
-            action_probs, leaf_value = self._policy(state)
-            
-            end, winner = state.game_end()
-            if not end:
-                node.expand(action_probs)
-            else:
-                if winner == -1:  # hòa
-                    leaf_value = 0.0
-                else:
-                    leaf_value = (1.0 if winner == state.current_player else -1.0)
-
-        # Update Q-values and visit counts ngược lên root
-        node.update_recursive(-leaf_value)
+        """Run one compatibility playout through the batched implementation."""
+        old_n_playout = self._n_playout
+        old_vl_k = self._vl_k
+        old_n_vl = self._n_vl
+        try:
+            self._n_playout = 1
+            self._vl_k = 1
+            self._n_vl = 0.0
+            self.get_move_probs(state, temp=1.0)
+        finally:
+            self._n_playout = old_n_playout
+            self._vl_k = old_vl_k
+            self._n_vl = old_n_vl
 
     def get_move_probs(self, state, temp=1e-3,
                        dirichlet_alpha=None, noise_eps=0.0):
