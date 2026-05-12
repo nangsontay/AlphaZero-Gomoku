@@ -1525,9 +1525,16 @@ class TrainPipeline(object):
         state_batch = [d[0] for d in mini_batch]
         mcts_probs_batch = [d[1] for d in mini_batch]
         winner_batch = [d[2] for d in mini_batch]
-        tactic_batch = [d[3] if len(d) > 3 else np.zeros(
-            self.board_width * self.board_height, dtype=np.float32)
-            for d in mini_batch]
+        tactic_batch = []
+        tactic_mask = []
+        for d in mini_batch:
+            if len(d) > 3:
+                tactic_batch.append(d[3])
+                tactic_mask.append(1.0)
+            else:
+                tactic_batch.append(np.zeros(
+                    self.board_width * self.board_height, dtype=np.float32))
+                tactic_mask.append(0.0)
 
         self.learn_rate = self.get_scheduled_lr()
 
@@ -1551,7 +1558,8 @@ class TrainPipeline(object):
             loss, entropy = self.policy_value_net.train_step(
                 state_batch, mcts_probs_batch, winner_batch,
                 warmup_lr * self.lr_multiplier,
-                tactic_batch=tactic_batch)
+                tactic_batch=tactic_batch,
+                tactic_mask=tactic_mask)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                 np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)), axis=1))

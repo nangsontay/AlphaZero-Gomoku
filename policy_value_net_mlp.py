@@ -412,15 +412,18 @@ class PolicyValueNet:
         return act_probs, value
 
     def train_step(self, state_batch, mcts_probs, winner_batch, lr,
-                   tactic_batch=None):
+                   tactic_batch=None, tactic_mask=None):
         """perform a training step (v2 §3.4 with E04 finite-loss guard)."""
         self.policy_value_net.train()
         state_batch = self._to_tensor(state_batch)
         mcts_probs = self._to_tensor(mcts_probs)
         winner_batch = self._to_tensor(winner_batch)
         tactic_targets = None
+        tactic_mask_tensor = None
         if tactic_batch is not None:
             tactic_targets = self._to_tensor(tactic_batch)
+            if tactic_mask is not None:
+                tactic_mask_tensor = self._to_tensor(tactic_mask).view(-1, 1)
 
         self.optimizer.zero_grad(set_to_none=True)
         set_learning_rate(self.optimizer, lr)
@@ -431,8 +434,14 @@ class PolicyValueNet:
             policy_loss = -torch.mean(torch.sum(mcts_probs * log_p, dim=1))
             loss = value_loss + policy_loss
             if tactic_targets is not None and self.tactic_loss_weight > 0.0:
-                tactic_loss = F.binary_cross_entropy_with_logits(
-                    tactic_logits, tactic_targets)
+                tactic_loss_raw = F.binary_cross_entropy_with_logits(
+                    tactic_logits, tactic_targets, reduction='none')
+                if tactic_mask_tensor is not None:
+                    tactic_loss_raw = tactic_loss_raw * tactic_mask_tensor
+                    valid_elements = tactic_mask_tensor.sum() * tactic_loss_raw.size(1)
+                    tactic_loss = tactic_loss_raw.sum() / valid_elements.clamp_min(1.0)
+                else:
+                    tactic_loss = tactic_loss_raw.mean()
                 loss = loss + self.tactic_loss_weight * tactic_loss
 
             # Optional symmetry regularisation (see §6).
