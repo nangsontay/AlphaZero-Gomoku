@@ -1006,12 +1006,25 @@ class TrainPipeline(object):
         self.eval_games = int(eval_games)
         self.best_win_ratio = 0.0
         self.pure_mcts_playout_num = 400
+        self.hourly_checkpoint_interval = 3600.0
+        self.hourly_checkpoint_file = "./hourly_policy.model"
 
         self.policy_value_net = PolicyValueNet(
             self.board_width, self.board_height,
             model_file=init_model, use_gpu=self.use_gpu,
             sym_loss_weight=0.0,
             tactic_loss_weight=self.tactic_loss_weight)
+
+    def maybe_save_hourly_checkpoint(self, now, next_checkpoint_time):
+        if now < next_checkpoint_time:
+            return next_checkpoint_time, None
+
+        self.policy_value_net.save_model(self.hourly_checkpoint_file)
+        print("hourly checkpoint saved: {}".format(
+            self.hourly_checkpoint_file), flush=True)
+        while next_checkpoint_time <= now:
+            next_checkpoint_time += self.hourly_checkpoint_interval
+        return next_checkpoint_time, self.hourly_checkpoint_file
 
     def tactical_pretrain(self):
         """Run optional supervised pretraining for the auxiliary tactic head."""
@@ -1666,6 +1679,7 @@ class TrainPipeline(object):
             update_count = 0
             loop_count = 0
             last_save_update = 0
+            next_hourly_checkpoint_time = time.monotonic() + self.hourly_checkpoint_interval
             while update_count < target_updates:
                 self.check_async_processes()
                 loop_count += 1
@@ -1689,6 +1703,8 @@ class TrainPipeline(object):
                             update_count), flush=True)
                     self.policy_value_net.save_model("./current_policy.model")
                     last_save_update = update_count
+                next_hourly_checkpoint_time, hourly_checkpoint_path = self.maybe_save_hourly_checkpoint(
+                    time.monotonic(), next_hourly_checkpoint_time)
                 self.append_batch_log({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "batch": int(loop_count),
@@ -1700,6 +1716,7 @@ class TrainPipeline(object):
                     "eval_requests": int(replay_metrics["eval_requests"]),
                     "updated": update_metrics is not None,
                     "update_metrics": update_metrics,
+                    "hourly_checkpoint": hourly_checkpoint_path,
                 })
                 if (update_count > 0 and update_metrics is not None and
                         update_count % self.check_freq == 0):
