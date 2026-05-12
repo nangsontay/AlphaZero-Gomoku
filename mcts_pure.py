@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 A pure implementation of the Monte Carlo Tree Search (MCTS)
-
-@author: Junxiao Song
+Enhanced with tactical heuristics from strategy.md:
+  - Open Three / Open Four / Blocked Three / Gap pattern recognition
+  - Fork (Double Threat) detection
+  - Heuristic rollout policy (not purely random)
+  - Heuristic expansion priors (not uniform)
+  - Search tree reuse between moves
+  - Proximity-based move filtering on large boards
 """
 
 import numpy as np
@@ -10,24 +15,310 @@ import copy
 from operator import itemgetter
 
 
-def rollout_policy_fn(board):
-    """a coarse, fast version of policy_fn used in the rollout phase."""
-    # rollout randomly
+# ---------------------------------------------------------------------------
+# Pattern scoring engine — the heart of the tactical improvements.
+#
+# For each empty cell we score how good it is for attack (current player)
+# and defence (opponent).  The scoring recognises:
+#   - Win-in-1          (5 in a row)
+#   - Open Four          (4 in a row, both ends open)
+#   - Half-open Four     (4 in a row, one end open — "blocked four")
+#   - Open Three         (3 in a row, both ends open)
+#   - Blocked Three      (3 in a row, one end blocked)
+#   - Gap patterns       (e.g. XX_X, X_XX)
+#   - Open Two           (2 in a row, both ends open)
+#
+# A fork is detected when a single move creates ≥2 "open three or better"
+# threats simultaneously.
+# ---------------------------------------------------------------------------
+
+# Score weights (tuned for Gomoku heuristic strength)
+_SCORE_WIN         = 1000000   # 5-in-a-row — instant win
+_SCORE_OPEN_FOUR   = 100000    # ○●●●●○  — unstoppable unless opponent has win
+_SCORE_HALF_FOUR   = 5000      # ×●●●●○  — must block
+_SCORE_OPEN_THREE  = 3000      # ○●●●○   — very dangerous
+_SCORE_BLOCKED_THREE = 400     # ×●●●○   — moderate threat
+_SCORE_GAP_THREE   = 2500      # ●●_●  or  ●_●●  — sneaky, forms open four
+_SCORE_OPEN_TWO    = 200       # ○●●○
+_SCORE_BLOCKED_TWO = 30        # ×●●○
+_SCORE_FORK_BONUS  = 80000     # creating ≥2 open-threes / gap-threes at once
+
+# Defence multiplier: blocking an opponent threat is almost as good as
+# creating your own, but slightly less to prefer offence when equal.
+_DEFENCE_MULTIPLIER = 0.95
+
+
+def _line_score(count, open_ends, has_gap=False):
+    """Return a heuristic score for a line pattern.
+
+    count     : number of own stones (including the candidate move)
+    open_ends : 0, 1, or 2 open ends around the line
+    has_gap   : True if the line contains a gap (e.g. XX_X)
+    """
+    if open_ends == 0 and not has_gap:
+        return 0  # fully blocked, useless
+
+    if count >= 5:
+        return _SCORE_WIN
+
+    if count == 4:
+        if open_ends == 2:
+            return _SCORE_OPEN_FOUR
+        elif open_ends >= 1 or has_gap:
+            return _SCORE_HALF_FOUR
+        return 0
+
+    if count == 3:
+        if has_gap:
+            return _SCORE_GAP_THREE  # e.g. XX_X — can become open four
+        if open_ends == 2:
+            return _SCORE_OPEN_THREE
+        elif open_ends == 1:
+            return _SCORE_BLOCKED_THREE
+        return 0
+
+    if count == 2:
+        if open_ends == 2:
+            return _SCORE_OPEN_TWO
+        elif open_ends == 1:
+            return _SCORE_BLOCKED_TWO
+        return 0
+
+    return 0
+
+
+def _scan_direction(board, move, player, dh, dw):
+    """Scan one direction (and its reverse) from `move` for `player`.
+
+    Returns (count, open_ends, has_gap) where count includes the candidate
+    move itself.
+    """
+    h = move // board.width
+    w = move % board.width
+    states = board.states
+    n_in_row = board.n_in_row
+
+    count = 1
+    open_ends = 0
+    has_gap = False
+
+    # --- forward direction ---
+    gap_used_fwd = False
+    r, c = h + dh, w + dw
+    while 0 <= r < board.height and 0 <= c < board.width:
+        pos = r * board.width + c
+        if states.get(pos) == player:
+            count += 1
+            r += dh
+            c += dw
+        elif not gap_used_fwd and states.get(pos) is None:
+            # check if there's a stone after the gap
+            nr, nc = r + dh, c + dw
+            if (0 <= nr < board.height and 0 <= nc < board.width and
+                    states.get(nr * board.width + nc) == player):
+                gap_used_fwd = True
+                has_gap = True
+                count += 1  # count the stone after gap
+                r, c = nr + dh, nc + dw
+                continue
+            else:
+                open_ends += 1
+                break
+        else:
+            if states.get(pos) is None:
+                open_ends += 1
+            break
+    else:
+        pass  # hit board edge => not open
+
+    # --- backward direction ---
+    gap_used_bwd = False
+    r, c = h - dh, w - dw
+    while 0 <= r < board.height and 0 <= c < board.width:
+        pos = r * board.width + c
+        if states.get(pos) == player:
+            count += 1
+            r -= dh
+            c -= dw
+        elif not gap_used_bwd and states.get(pos) is None:
+            nr, nc = r - dh, c - dw
+            if (0 <= nr < board.height and 0 <= nc < board.width and
+                    states.get(nr * board.width + nc) == player):
+                gap_used_bwd = True
+                has_gap = True
+                count += 1
+                r, c = nr - dh, nc - dw
+                continue
+            else:
+                open_ends += 1
+                break
+        else:
+            if states.get(pos) is None:
+                open_ends += 1
+            break
+    else:
+        pass  # hit board edge
+
+    # Cap count at n_in_row (e.g. 5) — more doesn't help.
+    count = min(count, n_in_row)
+    open_ends = min(open_ends, 2)
+
+    return count, open_ends, has_gap
+
+
+_DIRECTIONS = [(0, 1), (1, 0), (1, 1), (1, -1)]
+
+
+def _evaluate_move(board, move, player):
+    """Return (total_score, n_strong_threats) for `player` placing at `move`.
+
+    n_strong_threats counts how many directions produce an open-three-or-better
+    pattern; ≥2 means a fork.
+    """
+    total = 0
+    strong_threats = 0  # count of open-three-or-better per direction
+    for dh, dw in _DIRECTIONS:
+        count, open_ends, has_gap = _scan_direction(board, move, player, dh, dw)
+        s = _line_score(count, open_ends, has_gap)
+        total += s
+        if s >= _SCORE_GAP_THREE:  # open three, gap three, or better
+            strong_threats += 1
+    # Fork bonus: two or more strong threats at once
+    if strong_threats >= 2:
+        total += _SCORE_FORK_BONUS
+    return total, strong_threats
+
+
+def _move_heuristic_score(board, move):
+    """Combined attack + defence score for a single move."""
+    curr = board.current_player
+    opp = board.players[0] if curr == board.players[1] else board.players[1]
+
+    atk_score, _ = _evaluate_move(board, move, curr)
+    def_score, _ = _evaluate_move(board, move, opp)
+
+    return atk_score + _DEFENCE_MULTIPLIER * def_score
+
+
+# ---------------------------------------------------------------------------
+# Proximity filter: on a 15×15 board with few stones, restrict candidate
+# moves to cells within `radius` of any existing stone.  This massively
+# reduces the branching factor early on.
+# ---------------------------------------------------------------------------
+
+def _get_candidate_moves(board, radius=2):
+    """Return a subset of board.availables near existing stones."""
+    if not board.states:
+        # Empty board — play centre.
+        centre = (board.height // 2) * board.width + (board.width // 2)
+        return [centre]
+
+    neighbours = set()
+    for pos in board.states:
+        h = pos // board.width
+        w = pos % board.width
+        for dh in range(-radius, radius + 1):
+            for dw in range(-radius, radius + 1):
+                nh, nw = h + dh, w + dw
+                if 0 <= nh < board.height and 0 <= nw < board.width:
+                    nb = nh * board.width + nw
+                    if nb in board._available_set:
+                        neighbours.add(nb)
+
+    # Safety: if filter is too aggressive, fall back to all availables.
+    if not neighbours:
+        return list(board.availables)
+    return list(neighbours)
+
+
+# ---------------------------------------------------------------------------
+# Heuristic policy functions (replacing pure random / uniform)
+# ---------------------------------------------------------------------------
+
+def heuristic_rollout_policy_fn(board):
+    """Semi-smart rollout policy used during the simulation phase.
+
+    1. If there's a winning move or must-block move, play it.
+    2. Otherwise score all candidate moves with the pattern engine and pick
+       probabilistically (weighted by score) so rollouts aren't deterministic.
+    """
     from tactic import get_tactic_forced_move
     forced_move, is_win = get_tactic_forced_move(board)
     if forced_move is not None:
         return [(forced_move, 1.0)]
-    action_probs = np.random.rand(len(board.availables))
-    return zip(board.availables, action_probs)
+
+    candidates = _get_candidate_moves(board, radius=1)
+    scores = np.array([_move_heuristic_score(board, m) for m in candidates],
+                      dtype=np.float64)
+
+    # Add a small uniform floor so every candidate has some chance.
+    scores = scores + 1.0
+
+    # Add a bit of randomness to avoid fully deterministic rollouts.
+    noise = np.random.rand(len(scores)) * 0.1 * np.mean(scores)
+    scores = scores + noise
+
+    return zip(candidates, scores)
 
 
-def policy_value_fn(board):
-    """a function that takes in a state and outputs a list of (action, probability)
-    tuples and a score for the state"""
-    # return uniform probabilities and 0 score for pure MCTS
-    action_probs = np.ones(len(board.availables))/len(board.availables)
-    return zip(board.availables, action_probs), 0
+def heuristic_policy_value_fn(board):
+    """Heuristic expansion prior: score each legal move using the pattern
+    engine and convert to a probability distribution.
 
+    Also returns a rough board evaluation in [-1, 1].
+    """
+    candidates = _get_candidate_moves(board, radius=2)
+    if not candidates:
+        candidates = list(board.availables)
+
+    curr = board.current_player
+    opp = board.players[0] if curr == board.players[1] else board.players[1]
+
+    scores = []
+    best_atk = 0
+    best_def = 0
+    for m in candidates:
+        atk, _ = _evaluate_move(board, m, curr)
+        dfn, _ = _evaluate_move(board, m, opp)
+        combined = atk + _DEFENCE_MULTIPLIER * dfn
+        scores.append(combined)
+        best_atk = max(best_atk, atk)
+        best_def = max(best_def, dfn)
+
+    scores = np.array(scores, dtype=np.float64)
+    scores = scores + 1.0  # floor
+
+    # Softmax-like conversion to probabilities (temperature controls sharpness)
+    temperature = 1.0
+    log_scores = np.log(scores + 1e-10) / temperature
+    log_scores -= np.max(log_scores)
+    probs = np.exp(log_scores)
+    probs /= probs.sum()
+
+    action_probs = list(zip(candidates, probs))
+
+    # Rough value estimate: if we have a winning threat, value ≈ +1;
+    # if opponent does, value ≈ -1.
+    value = 0.0
+    if best_atk >= _SCORE_WIN:
+        value = 1.0
+    elif best_def >= _SCORE_WIN:
+        value = -1.0
+    elif best_atk >= _SCORE_OPEN_FOUR:
+        value = 0.8
+    elif best_def >= _SCORE_OPEN_FOUR:
+        value = -0.8
+    elif best_atk >= _SCORE_OPEN_THREE:
+        value = 0.3
+    elif best_def >= _SCORE_OPEN_THREE:
+        value = -0.3
+
+    return action_probs, value
+
+
+# ---------------------------------------------------------------------------
+# MCTS tree node (unchanged from original)
+# ---------------------------------------------------------------------------
 
 class TreeNode(object):
     """A node in the MCTS tree. Each node keeps track of its own value Q,
@@ -97,8 +388,12 @@ class TreeNode(object):
         return self._parent is None
 
 
+# ---------------------------------------------------------------------------
+# MCTS with tactical enhancements
+# ---------------------------------------------------------------------------
+
 class MCTS(object):
-    """A simple implementation of Monte Carlo Tree Search."""
+    """Monte Carlo Tree Search with heuristic rollout and expansion."""
 
     def __init__(self, policy_value_fn, c_puct=5, n_playout=10000):
         """
@@ -133,13 +428,13 @@ class MCTS(object):
         if not end:
             action_probs, _ = self._policy(state)
             node.expand(action_probs)
-        # Evaluate the leaf node by random rollout
+        # Evaluate the leaf node by heuristic rollout
         leaf_value = self._evaluate_rollout(state)
         # Update value and visit count of nodes in this traversal.
         node.update_recursive(-leaf_value)
 
-    def _evaluate_rollout(self, state, limit=1000):
-        """Use the rollout policy to play until the end of the game,
+    def _evaluate_rollout(self, state, limit=500):
+        """Use the heuristic rollout policy to play until the end of the game,
         returning +1 if the current player wins, -1 if the opponent wins,
         and 0 if it is a tie.
         """
@@ -148,7 +443,7 @@ class MCTS(object):
             end, winner = state.game_end()
             if end:
                 break
-            action_probs = rollout_policy_fn(state)
+            action_probs = heuristic_rollout_policy_fn(state)
             max_action = max(action_probs, key=itemgetter(1))[0]
             state.do_move(max_action)
         else:
@@ -166,7 +461,7 @@ class MCTS(object):
         Return: the selected action
         """
         for n in range(self._n_playout):
-            state_copy = copy.deepcopy(state)
+            state_copy = state.copy_fast()
             self._playout(state_copy)
         return max(self._root._children.items(),
                    key=lambda act_node: act_node[1]._n_visits)[0]
@@ -186,9 +481,9 @@ class MCTS(object):
 
 
 class MCTSPlayer(object):
-    """AI player based on MCTS"""
+    """AI player based on MCTS with tactical heuristics."""
     def __init__(self, c_puct=5, n_playout=2000):
-        self.mcts = MCTS(policy_value_fn, c_puct, n_playout)
+        self.mcts = MCTS(heuristic_policy_value_fn, c_puct, n_playout)
 
     def set_player_ind(self, p):
         self.player = p
@@ -200,10 +495,15 @@ class MCTSPlayer(object):
         sensible_moves = board.availables
         if len(sensible_moves) > 0:
             move = self.mcts.get_move(board)
-            self.mcts.update_with_move(-1)
+            # Reuse subtree: advance tree by the move we chose.
+            self.mcts.update_with_move(move)
             return move
         else:
             print("WARNING: the board is full")
+
+    def notify_opponent_move(self, move):
+        """Call this after the opponent plays so the tree can be reused."""
+        self.mcts.update_with_move(move)
 
     def __str__(self):
         return "MCTS {}".format(self.player)
