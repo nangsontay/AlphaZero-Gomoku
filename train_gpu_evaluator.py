@@ -973,7 +973,7 @@ class TrainPipeline(object):
         self.board = Board(width=self.board_width, height=self.board_height,
                            n_in_row=self.n_in_row)
         self.game = Game(self.board)
-        self.learn_rate = 5e-4
+        self.learn_rate = 1e-3
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.n_playout = int(n_playout)
@@ -992,15 +992,15 @@ class TrainPipeline(object):
         self.batch_size = int(batch_size)
         self.check_freq = max(1, int(check_freq))
         self.data_buffer = deque(maxlen=self.buffer_size)
-        self.epochs = 5
+        self.epochs = 2
         self.kl_targ = 0.03
         self.global_update_count = 0
         self.weight_push_every = 4
         self.lr_schedule = [
-            (1500, 5e-4),
-            (8000, 2e-4),
-            (30000, 5e-5),
-            (float("inf"), 1e-5),
+            (1500, 1e-3),
+            (8000, 4e-4),
+            (30000, 1e-4),
+            (float("inf"), 2e-5),
         ]
         self.game_batch_num = int(game_batch_num)
         self.eval_games = int(eval_games)
