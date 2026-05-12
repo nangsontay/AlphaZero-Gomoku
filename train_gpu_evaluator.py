@@ -19,6 +19,14 @@ import time
 import traceback
 from collections import defaultdict, deque
 from multiprocessing import resource_tracker, shared_memory
+import numpy as np
+import torch
+
+from game import Board, Game
+from mcts_pure import MCTSPlayer as MCTS_Pure
+from mcts_alphaZero import MCTSPlayer
+from policy_value_net_mlp import PolicyValueNet
+from tactic import get_tactic_label_vector
 
 
 class _ShuttingDown(Exception):
@@ -83,13 +91,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-import numpy as np
-import torch
 
-from game import Board, Game
-from mcts_pure import MCTSPlayer as MCTS_Pure
-from mcts_alphaZero import MCTSPlayer
-from policy_value_net_pytorch import PolicyValueNet
 
 
 def set_cpu_threads(n=1):
@@ -106,25 +108,80 @@ def set_cpu_threads(n=1):
 
 def get_equi_data(play_data, board_width, board_height):
     extend_data = []
-    for state, mcts_prob, winner in play_data:
+    for sample in play_data:
+        state, mcts_prob, winner = sample[:3]
+        tactic_label = sample[3] if len(sample) > 3 else None
         for i in range(4):
             equi_state = np.array([np.rot90(s, i) for s in state])
             equi_mcts_prob = np.rot90(
                 mcts_prob.reshape(board_height, board_width), i
             )
-            extend_data.append((
-                equi_state,
-                equi_mcts_prob.flatten(),
-                winner,
-            ))
+            if tactic_label is None:
+                extend_data.append((
+                    equi_state,
+                    equi_mcts_prob.flatten(),
+                    winner,
+                ))
+            else:
+                equi_tactic = np.rot90(
+                    tactic_label.reshape(board_height, board_width), i
+                )
+                extend_data.append((
+                    equi_state,
+                    equi_mcts_prob.flatten(),
+                    winner,
+                    equi_tactic.flatten(),
+                ))
             equi_state_flip = np.array([np.fliplr(s) for s in equi_state])
             equi_mcts_prob_flip = np.fliplr(equi_mcts_prob)
-            extend_data.append((
-                equi_state_flip,
-                equi_mcts_prob_flip.flatten(),
-                winner,
-            ))
+            if tactic_label is None:
+                extend_data.append((
+                    equi_state_flip,
+                    equi_mcts_prob_flip.flatten(),
+                    winner,
+                ))
+            else:
+                equi_tactic_flip = np.fliplr(equi_tactic)
+                extend_data.append((
+                    equi_state_flip,
+                    equi_mcts_prob_flip.flatten(),
+                    winner,
+                    equi_tactic_flip.flatten(),
+                ))
     return extend_data
+
+
+def generate_tactical_samples(board_width=15, board_height=15, n_in_row=5,
+                              num_samples=2048, max_random_moves=36,
+                              seed=None):
+    """Generate lightweight tactical states and labels from random legal boards."""
+    rng = random.Random(seed)
+    samples = []
+    attempts = 0
+    max_attempts = max(int(num_samples) * 20, 100)
+    while len(samples) < int(num_samples) and attempts < max_attempts:
+        attempts += 1
+        board = Board(width=board_width, height=board_height, n_in_row=n_in_row)
+        board.init_board(start_player=rng.randrange(2))
+        move_count = rng.randint(max(0, n_in_row - 2), max(0, int(max_random_moves)))
+        for _ in range(move_count):
+            if not board.availables:
+                break
+            move = rng.choice(board.availables)
+            board.do_move(move)
+            end, _ = board.game_end()
+            if end:
+                break
+        end, _ = board.game_end()
+        if end or not board.availables:
+            continue
+        tactic_label = get_tactic_label_vector(board)
+        if float(tactic_label.max()) <= 0.0:
+            continue
+        state = board.current_state().copy().astype(np.float32)
+        dummy_policy = np.zeros(board_width * board_height, dtype=np.float32)
+        samples.append((state, dummy_policy, 0.0, tactic_label))
+    return get_equi_data(samples, board_width, board_height)
 
 
 class RemotePolicyValueClient(object):
@@ -439,7 +496,7 @@ class CudaGraphInferenceWrapper(object):
         self.graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(self.graph):
-                self.static_log_p, self.static_v = self.model(self.static_in)
+                self.static_log_p, self.static_v, _ = self.model(self.static_in)
 
     def run(self, batch_np):
         batch_np = np.ascontiguousarray(batch_np, dtype=np.float32)
@@ -759,7 +816,9 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                                  noise_eps=noise_eps,
                                  vl_k=vl_k,
                                  n_vl=n_vl,
-                                 max_oversample=max_oversample)
+                                  max_oversample=max_oversample,
+                                  tactic_prior_weight=float(args.get(
+                                      "tactic_prior_weight", 0.0)))
 
         episode_lens = []
         all_data = []
@@ -776,7 +835,8 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                 temp=temp,
                 temperature_moves=temperature_moves,
                 temp_high=temp_high,
-                temp_low=temp_low)
+                temp_low=temp_low,
+                return_tactic_labels=True)
             play_data = list(play_data)
             augmented = get_equi_data(play_data, bw, bh)
             episode_lens.append(len(play_data))
@@ -852,14 +912,20 @@ class TrainPipeline(object):
                  games_per_worker=1, threads_per_worker=1, n_playout=800,
                  batch_size=512, game_batch_num=1500, check_freq=50,
                  eval_games=10, eval_batch_size=256, eval_timeout_ms=8,
-                 response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
+                 response_timeout=180.0, c_puct=3.0, eval_n_playout=400,
                  dirichlet_alpha=0.05, noise_eps=0.25,
                  vl_k=4, n_vl=1.0, max_oversample=3,
                  temperature_moves=8, temp_high=1.0, temp_low=1e-3,
-                 buffer_size=500000, recent_sample_window=200000,
-                 worker_model_file="./_tmp_gpu_evaluator_policy.model",
-                 batch_log_file="training_batches.log",
-                 use_cuda_graphs=True, inference_fp16=True):
+                  buffer_size=500000, recent_sample_window=200000,
+                  worker_model_file="./_tmp_gpu_evaluator_policy.model",
+                  batch_log_file="training_batches.log",
+                  use_cuda_graphs=True, inference_fp16=True,
+                  tactic_pretrain_steps=100,
+                  tactic_pretrain_samples=2048,
+                  tactic_pretrain_batch_size=256,
+                  tactic_pretrain_lr=5e-4,
+                  tactic_loss_weight=0.25,
+                  tactic_prior_weight=0.0):
         self.use_gpu = bool(use_gpu)
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
@@ -877,6 +943,12 @@ class TrainPipeline(object):
         self.batch_log_file = batch_log_file
         self.use_cuda_graphs = bool(use_cuda_graphs)
         self.inference_fp16 = bool(inference_fp16)
+        self.tactic_pretrain_steps = max(0, int(tactic_pretrain_steps))
+        self.tactic_pretrain_samples = max(0, int(tactic_pretrain_samples))
+        self.tactic_pretrain_batch_size = max(1, int(tactic_pretrain_batch_size))
+        self.tactic_pretrain_lr = float(tactic_pretrain_lr)
+        self.tactic_loss_weight = max(0.0, float(tactic_loss_weight))
+        self.tactic_prior_weight = max(0.0, float(tactic_prior_weight))
         self.last_update_metrics = None
         self.ctx = None
         self.request_queue = None
@@ -901,7 +973,7 @@ class TrainPipeline(object):
         self.board = Board(width=self.board_width, height=self.board_height,
                            n_in_row=self.n_in_row)
         self.game = Game(self.board)
-        self.learn_rate = 2e-3
+        self.learn_rate = 5e-4
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.n_playout = int(n_playout)
@@ -921,23 +993,68 @@ class TrainPipeline(object):
         self.check_freq = max(1, int(check_freq))
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.epochs = 5
-        self.kl_targ = 0.02
+        self.kl_targ = 0.03
         self.global_update_count = 0
         self.weight_push_every = 4
         self.lr_schedule = [
-            (3000, 2e-3),
-            (15000, 5e-4),
-            (40000, 1e-4),
-            (float("inf"), 2e-5),
+            (1500, 5e-4),
+            (8000, 2e-4),
+            (30000, 5e-5),
+            (float("inf"), 1e-5),
         ]
         self.game_batch_num = int(game_batch_num)
         self.eval_games = int(eval_games)
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 2000
+        self.pure_mcts_playout_num = 400
+        self.hourly_checkpoint_interval = 3600.0
+        self.hourly_checkpoint_file = "./hourly_policy.model"
 
         self.policy_value_net = PolicyValueNet(
             self.board_width, self.board_height,
-            model_file=init_model, use_gpu=self.use_gpu)
+            model_file=init_model, use_gpu=self.use_gpu,
+            sym_loss_weight=0.0,
+            tactic_loss_weight=self.tactic_loss_weight)
+
+    def maybe_save_hourly_checkpoint(self, now, next_checkpoint_time):
+        if now < next_checkpoint_time:
+            return next_checkpoint_time, None
+
+        self.policy_value_net.save_model(self.hourly_checkpoint_file)
+        print("hourly checkpoint saved: {}".format(
+            self.hourly_checkpoint_file), flush=True)
+        while next_checkpoint_time <= now:
+            next_checkpoint_time += self.hourly_checkpoint_interval
+        return next_checkpoint_time, self.hourly_checkpoint_file
+
+    def tactical_pretrain(self):
+        """Run optional supervised pretraining for the auxiliary tactic head."""
+        if self.tactic_pretrain_steps <= 0 or self.tactic_pretrain_samples <= 0:
+            print("tactical pretraining disabled", flush=True)
+            return
+        print("tactical pretraining: samples={}, steps={}, batch_size={}, lr={:.6g}".format(
+            self.tactic_pretrain_samples, self.tactic_pretrain_steps,
+            self.tactic_pretrain_batch_size, self.tactic_pretrain_lr), flush=True)
+        data = generate_tactical_samples(
+            self.board_width, self.board_height, self.n_in_row,
+            num_samples=self.tactic_pretrain_samples,
+            seed=int(time.time()) % (2 ** 31 - 1))
+        if not data:
+            print("tactical pretraining skipped: no tactical samples generated", flush=True)
+            return
+        losses = []
+        for step in range(self.tactic_pretrain_steps):
+            batch_size = min(self.tactic_pretrain_batch_size, len(data))
+            mini_batch = random.sample(data, batch_size)
+            state_batch = [d[0] for d in mini_batch]
+            tactic_batch = [d[3] for d in mini_batch]
+            loss = self.policy_value_net.tactic_train_step(
+                state_batch, tactic_batch, self.tactic_pretrain_lr)
+            losses.append(float(loss))
+            if (step + 1) % max(1, self.tactic_pretrain_steps // 5) == 0:
+                print("tactical pretrain step {}/{}: loss={:.6f}".format(
+                    step + 1, self.tactic_pretrain_steps, float(loss)), flush=True)
+        print("tactical pretraining done: generated_positions={}, mean_loss={:.6f}".format(
+            len(data), float(np.nanmean(losses)) if losses else 0.0), flush=True)
 
     def save_cpu_model_for_evaluator(self):
         sd = self.policy_value_net.get_policy_param()
@@ -1203,6 +1320,7 @@ class TrainPipeline(object):
                 "vl_k": self.vl_k,
                 "n_vl": self.n_vl,
                 "max_oversample": self.max_oversample,
+                "tactic_prior_weight": self.tactic_prior_weight,
                 "temperature_moves": self.temperature_moves,
                 "temp_high": self.temp_high,
                 "temp_low": self.temp_low,
@@ -1407,8 +1525,23 @@ class TrainPipeline(object):
         state_batch = [d[0] for d in mini_batch]
         mcts_probs_batch = [d[1] for d in mini_batch]
         winner_batch = [d[2] for d in mini_batch]
+        tactic_batch = [d[3] if len(d) > 3 else np.zeros(
+            self.board_width * self.board_height, dtype=np.float32)
+            for d in mini_batch]
 
         self.learn_rate = self.get_scheduled_lr()
+
+        # Counter normalisation rule: warmup is anchored on
+        # `global_update_count` defined as "number of `train_step` invocations
+        # on the main trainer's network". This counter is a property of the
+        # trainer, NOT the worker count. Same convention applies in train.py
+        # and train_mp.py.
+        warmup_steps = 500
+        if self.global_update_count < warmup_steps:
+            warmup_lr = self.learn_rate * (self.global_update_count + 1) / warmup_steps
+        else:
+            warmup_lr = self.learn_rate
+
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
         kl = 0.0
         loss = 0.0
@@ -1417,7 +1550,8 @@ class TrainPipeline(object):
         for _ in range(self.epochs):
             loss, entropy = self.policy_value_net.train_step(
                 state_batch, mcts_probs_batch, winner_batch,
-                self.learn_rate * self.lr_multiplier)
+                warmup_lr * self.lr_multiplier,
+                tactic_batch=tactic_batch)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                 np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)), axis=1))
@@ -1502,16 +1636,19 @@ class TrainPipeline(object):
                              policy_value_batch_fn,
                              c_puct=self.c_puct,
                              n_playout=self.eval_n_playout,
-                             vl_k=self.vl_k,
-                             n_vl=self.n_vl,
-                             max_oversample=self.max_oversample)
+                              vl_k=self.vl_k,
+                              n_vl=self.n_vl,
+                              max_oversample=self.max_oversample,
+                              tactic_prior_weight=self.tactic_prior_weight)
         pure = MCTS_Pure(c_puct=5, n_playout=self.pure_mcts_playout_num)
         win_cnt = defaultdict(int)
         eval_start = time.time()
         for i in range(n_games):
             game_start = time.time()
+            move_log_prefix = "[eval game {}/{}]".format(i + 1, n_games)
             winner = self.game.start_play(current, pure, start_player=i % 2,
-                                          is_shown=0)
+                                          is_shown=0,
+                                          move_log_prefix=move_log_prefix)
             win_cnt[winner] += 1
             elapsed = time.time() - game_start
             total_elapsed = time.time() - eval_start
@@ -1535,12 +1672,14 @@ class TrainPipeline(object):
         return win_ratio
 
     def run(self):
+        self.tactical_pretrain()
         self.start_async_pipeline()
         try:
             target_updates = self.game_batch_num
             update_count = 0
             loop_count = 0
             last_save_update = 0
+            next_hourly_checkpoint_time = time.monotonic() + self.hourly_checkpoint_interval
             while update_count < target_updates:
                 self.check_async_processes()
                 loop_count += 1
@@ -1564,6 +1703,8 @@ class TrainPipeline(object):
                             update_count), flush=True)
                     self.policy_value_net.save_model("./current_policy.model")
                     last_save_update = update_count
+                next_hourly_checkpoint_time, hourly_checkpoint_path = self.maybe_save_hourly_checkpoint(
+                    time.monotonic(), next_hourly_checkpoint_time)
                 self.append_batch_log({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "batch": int(loop_count),
@@ -1575,6 +1716,7 @@ class TrainPipeline(object):
                     "eval_requests": int(replay_metrics["eval_requests"]),
                     "updated": update_metrics is not None,
                     "update_metrics": update_metrics,
+                    "hourly_checkpoint": hourly_checkpoint_path,
                 })
                 if (update_count > 0 and update_metrics is not None and
                         update_count % self.check_freq == 0):
@@ -1630,7 +1772,7 @@ def parse_args():
     p.add_argument("--games-per-worker", type=int, default=1)
     p.add_argument("--threads-per-worker", type=int, default=1)
     p.add_argument("--n-playout", type=int, default=800)
-    p.add_argument("--eval-n-playout", type=int, default=1600)
+    p.add_argument("--eval-n-playout", type=int, default=400)
     p.add_argument("--c-puct", type=float, default=3.0)
     p.add_argument("--dirichlet-alpha", type=float, default=0.05)
     p.add_argument("--noise-eps", type=float, default=0.25)
@@ -1649,7 +1791,7 @@ def parse_args():
     p.add_argument("--game-batch-num", type=int, default=1500)
     p.add_argument("--check-freq", type=int, default=50,
                    help="Run policy evaluation every N training updates.")
-    p.add_argument("--eval-games", type=int, default=10)
+    p.add_argument("--eval-games", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=256)
     p.add_argument("--eval-timeout-ms", type=int, default=8)
     p.add_argument("--response-timeout", type=float, default=180.0)
@@ -1657,6 +1799,16 @@ def parse_args():
                    help="Disable evaluator CUDA Graph capture/replay.")
     p.add_argument("--disable-inference-fp16", action="store_true",
                    help="Disable evaluator FP16 + channels_last inference path.")
+    p.add_argument("--tactic-pretrain-steps", type=int, default=100,
+                   help="Auxiliary tactic-head pretraining steps before self-play. Use 0 to disable.")
+    p.add_argument("--tactic-pretrain-samples", type=int, default=2048,
+                   help="Number of generated tactical base samples before D4 augmentation.")
+    p.add_argument("--tactic-pretrain-batch-size", type=int, default=256)
+    p.add_argument("--tactic-pretrain-lr", type=float, default=5e-4)
+    p.add_argument("--tactic-loss-weight", type=float, default=0.25,
+                   help="Weight for auxiliary tactic BCE loss during policy updates. New self-play data carries B1 tactic labels; old 3-tuple replay still falls back to zero labels. Use 0 to disable.")
+    p.add_argument("--tactic-prior-weight", type=float, default=0.0,
+                   help="Soft MCTS prior multiplier for tactical moves. Default 0 disables P2 so tactics do not bias MCTS search.")
     p.add_argument("--batch-log-file", default="training_batches.log",
                    help="Path to append one JSON training summary per game batch. Use an empty string to disable.")
     return p.parse_args()
@@ -1697,5 +1849,11 @@ if __name__ == "__main__":
         batch_log_file=args.batch_log_file,
         use_cuda_graphs=not args.disable_cuda_graphs,
         inference_fp16=not args.disable_inference_fp16,
+        tactic_pretrain_steps=args.tactic_pretrain_steps,
+        tactic_pretrain_samples=args.tactic_pretrain_samples,
+        tactic_pretrain_batch_size=args.tactic_pretrain_batch_size,
+        tactic_pretrain_lr=args.tactic_pretrain_lr,
+        tactic_loss_weight=args.tactic_loss_weight,
+        tactic_prior_weight=args.tactic_prior_weight,
     )
     pipeline.run()

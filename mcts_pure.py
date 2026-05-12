@@ -13,6 +13,10 @@ from operator import itemgetter
 def rollout_policy_fn(board):
     """a coarse, fast version of policy_fn used in the rollout phase."""
     # rollout randomly
+    from tactic import get_tactic_forced_move
+    forced_move, is_win = get_tactic_forced_move(board)
+    if forced_move is not None:
+        return [(forced_move, 1.0)]
     action_probs = np.random.rand(len(board.availables))
     return zip(board.availables, action_probs)
 
