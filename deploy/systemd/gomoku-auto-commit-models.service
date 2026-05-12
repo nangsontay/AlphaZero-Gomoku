@@ -1,0 +1,13 @@
+[Unit]
+Description=Gomoku auto-commit and push model files
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/gomoku-auto-commit-models
+WorkingDirectory=/
+ExecStart=/usr/local/bin/gomoku-auto-commit-models
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
