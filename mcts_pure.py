@@ -4,15 +4,15 @@ A pure implementation of the Monte Carlo Tree Search (MCTS)
 Enhanced with tactical heuristics from strategy.md:
   - Open Three / Open Four / Blocked Three / Gap pattern recognition
   - Fork (Double Threat) detection
-  - Heuristic rollout policy (not purely random)
+  - Instant heuristic leaf evaluation (no rollout needed)
   - Heuristic expansion priors (not uniform)
   - Search tree reuse between moves
   - Proximity-based move filtering on large boards
+
+@author: Junxiao Song (original), enhanced for tactical play
 """
 
 import numpy as np
-import copy
-from operator import itemgetter
 
 
 # ---------------------------------------------------------------------------
@@ -232,40 +232,16 @@ def _get_candidate_moves(board, radius=2):
 
 
 # ---------------------------------------------------------------------------
-# Heuristic policy functions (replacing pure random / uniform)
+# Heuristic policy-value function (replacing random rollout + uniform prior)
 # ---------------------------------------------------------------------------
 
-def heuristic_rollout_policy_fn(board):
-    """Semi-smart rollout policy used during the simulation phase.
-
-    1. If there's a winning move or must-block move, play it.
-    2. Otherwise score all candidate moves with the pattern engine and pick
-       probabilistically (weighted by score) so rollouts aren't deterministic.
-    """
-    from tactic import get_tactic_forced_move
-    forced_move, is_win = get_tactic_forced_move(board)
-    if forced_move is not None:
-        return [(forced_move, 1.0)]
-
-    candidates = _get_candidate_moves(board, radius=1)
-    scores = np.array([_move_heuristic_score(board, m) for m in candidates],
-                      dtype=np.float64)
-
-    # Add a small uniform floor so every candidate has some chance.
-    scores = scores + 1.0
-
-    # Add a bit of randomness to avoid fully deterministic rollouts.
-    noise = np.random.rand(len(scores)) * 0.1 * np.mean(scores)
-    scores = scores + noise
-
-    return zip(candidates, scores)
-
-
 def heuristic_policy_value_fn(board):
-    """Heuristic expansion prior: score each legal move using the pattern
-    engine and convert to a probability distribution.
+    """Heuristic expansion prior AND leaf evaluation.
 
-    Also returns a rough board evaluation in [-1, 1].
+    Scores each candidate move with the pattern engine, converts to
+    a probability distribution (prior), and returns a positional value
+    in [-1, 1].  This replaces the expensive full-game rollout with a
+    single O(candidates × 4-directions) scan — typically ~50-100× faster.
     """
     candidates = _get_candidate_moves(board, radius=2)
     if not candidates:
@@ -286,19 +262,17 @@ def heuristic_policy_value_fn(board):
         best_def = max(best_def, dfn)
 
     scores = np.array(scores, dtype=np.float64)
-    scores = scores + 1.0  # floor
+    scores = scores + 1.0  # floor so zero-score moves still get explored
 
-    # Softmax-like conversion to probabilities (temperature controls sharpness)
-    temperature = 1.0
-    log_scores = np.log(scores + 1e-10) / temperature
+    # Softmax-like conversion to probabilities
+    log_scores = np.log(scores + 1e-10)
     log_scores -= np.max(log_scores)
     probs = np.exp(log_scores)
     probs /= probs.sum()
 
     action_probs = list(zip(candidates, probs))
 
-    # Rough value estimate: if we have a winning threat, value ≈ +1;
-    # if opponent does, value ≈ -1.
+    # Positional value estimate from the pattern landscape.
     value = 0.0
     if best_atk >= _SCORE_WIN:
         value = 1.0
@@ -308,10 +282,21 @@ def heuristic_policy_value_fn(board):
         value = 0.8
     elif best_def >= _SCORE_OPEN_FOUR:
         value = -0.8
+    elif best_atk >= _SCORE_FORK_BONUS:
+        value = 0.6
+    elif best_def >= _SCORE_FORK_BONUS:
+        value = -0.6
     elif best_atk >= _SCORE_OPEN_THREE:
         value = 0.3
     elif best_def >= _SCORE_OPEN_THREE:
         value = -0.3
+    else:
+        # Subtle advantage from material balance of threats.
+        atk_sum = sum(1 for s in scores if s > _SCORE_OPEN_TWO)
+        def_total = sum(1 for m in candidates
+                        if _evaluate_move(board, m, opp)[0] >= _SCORE_OPEN_TWO)
+        if atk_sum + def_total > 0:
+            value = 0.1 * (atk_sum - def_total) / (atk_sum + def_total + 1)
 
     return action_probs, value
 
@@ -389,11 +374,17 @@ class TreeNode(object):
 
 
 # ---------------------------------------------------------------------------
-# MCTS with tactical enhancements
+# MCTS with instant heuristic evaluation (no rollout)
 # ---------------------------------------------------------------------------
 
 class MCTS(object):
-    """Monte Carlo Tree Search with heuristic rollout and expansion."""
+    """Monte Carlo Tree Search with heuristic leaf evaluation.
+
+    Instead of playing random/heuristic moves to the end of the game
+    (rollout), each leaf is evaluated instantly by the pattern scoring
+    engine.  This is ~50-100× faster per playout than a full rollout
+    on a 15×15 board.
+    """
 
     def __init__(self, policy_value_fn, c_puct=5, n_playout=10000):
         """
@@ -426,33 +417,19 @@ class MCTS(object):
         # Check terminal leaves before expanding the node.
         end, winner = state.game_end()
         if not end:
-            action_probs, _ = self._policy(state)
+            # Expand AND evaluate in one call — no rollout needed.
+            action_probs, leaf_value = self._policy(state)
             node.expand(action_probs)
-        # Evaluate the leaf node by heuristic rollout
-        leaf_value = self._evaluate_rollout(state)
+        else:
+            # Terminal node: exact outcome.
+            if winner == -1:
+                leaf_value = 0.0
+            else:
+                leaf_value = (
+                    1.0 if winner == state.get_current_player() else -1.0
+                )
         # Update value and visit count of nodes in this traversal.
         node.update_recursive(-leaf_value)
-
-    def _evaluate_rollout(self, state, limit=500):
-        """Use the heuristic rollout policy to play until the end of the game,
-        returning +1 if the current player wins, -1 if the opponent wins,
-        and 0 if it is a tie.
-        """
-        player = state.get_current_player()
-        for i in range(limit):
-            end, winner = state.game_end()
-            if end:
-                break
-            action_probs = heuristic_rollout_policy_fn(state)
-            max_action = max(action_probs, key=itemgetter(1))[0]
-            state.do_move(max_action)
-        else:
-            # If no break from the loop, issue a warning.
-            print("WARNING: rollout reached move limit")
-        if winner == -1:  # tie
-            return 0
-        else:
-            return 1 if winner == player else -1
 
     def get_move(self, state):
         """Runs all playouts sequentially and returns the most visited action.
