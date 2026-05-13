@@ -35,17 +35,24 @@ import numpy as np
 # Score weights (tuned for Gomoku heuristic strength)
 _SCORE_WIN         = 1000000   # 5-in-a-row — instant win
 _SCORE_OPEN_FOUR   = 100000    # ○●●●●○  — unstoppable unless opponent has win
-_SCORE_HALF_FOUR   = 5000      # ×●●●●○  — must block
-_SCORE_OPEN_THREE  = 3000      # ○●●●○   — very dangerous
-_SCORE_BLOCKED_THREE = 400     # ×●●●○   — moderate threat
-_SCORE_GAP_THREE   = 2500      # ●●_●  or  ●_●●  — sneaky, forms open four
-_SCORE_OPEN_TWO    = 200       # ○●●○
-_SCORE_BLOCKED_TWO = 30        # ×●●○
-_SCORE_FORK_BONUS  = 80000     # creating ≥2 open-threes / gap-threes at once
+_SCORE_HALF_FOUR   = 8000      # ×●●●●○  — must block
+_SCORE_OPEN_THREE  = 4000      # ○●●●○   — very dangerous
+_SCORE_BLOCKED_THREE = 800     # ×●●●○   — moderate threat
+_SCORE_GAP_THREE   = 3500      # ●●_●  or  ●_●●  — sneaky, forms open four
+_SCORE_OPEN_TWO    = 600       # ○●●○    — building block for future threats
+_SCORE_BLOCKED_TWO = 80        # ×●●○
+_SCORE_OPEN_ONE    = 20        # ○●○     — small positional value
+
+# Combination bonuses — rewarding multi-directional threats
+_SCORE_FORK_BONUS       = 80000   # ≥2 strong threats (open three+) at once
+_SCORE_COMBO_BONUS      = 25000   # 1 strong + 1 moderate (open3 + blocked3)
+_SCORE_MODERATE_FORK    = 10000   # ≥2 moderate threats (blocked3 + blocked3)
+_SCORE_PREFORK_SETUP    = 1500    # ≥2 open twos converging — future fork
+_SCORE_SETUP_COMBO      = 900     # 1 open two + 1 moderate threat
 
 # Defence multiplier: blocking an opponent threat is almost as good as
 # creating your own, but slightly less to prefer offence when equal.
-_DEFENCE_MULTIPLIER = 0.95
+_DEFENCE_MULTIPLIER = 0.9
 
 
 def _line_score(count, open_ends, has_gap=False):
@@ -78,6 +85,11 @@ def _line_score(count, open_ends, has_gap=False):
         return 0
 
     if count == 2:
+        if has_gap:
+            # ●_● pattern — can become gap three with one move
+            if open_ends >= 1:
+                return _SCORE_BLOCKED_TWO * 3  # 240: more dangerous than simple blocked two
+            return _SCORE_BLOCKED_TWO
         if open_ends == 2:
             return _SCORE_OPEN_TWO
         elif open_ends == 1:
@@ -170,22 +182,48 @@ _DIRECTIONS = [(0, 1), (1, 0), (1, 1), (1, -1)]
 
 
 def _evaluate_move(board, move, player):
-    """Return (total_score, n_strong_threats) for `player` placing at `move`.
+    """Return (total_score, n_strong_threats, detail) for `player` at `move`.
 
-    n_strong_threats counts how many directions produce an open-three-or-better
-    pattern; ≥2 means a fork.
+    Threat classification per direction:
+      strong   : open three, gap three, open four, win  (score ≥ GAP_THREE)
+      moderate : blocked three, half-open four           (score ≥ BLOCKED_THREE)
+      building : open two                                (score ≥ OPEN_TWO)
+
+    Combination bonuses:
+      ≥2 strong             → fork bonus      (unstoppable)
+      1 strong + 1 moderate → combo bonus      (very hard to defend)
+      ≥2 moderate           → moderate fork    (hard to defend)
+      ≥2 building           → pre-fork setup   (future fork potential)
+      1 building + 1 mod    → setup combo      (growing advantage)
     """
     total = 0
-    strong_threats = 0  # count of open-three-or-better per direction
+    strong_threats = 0
+    moderate_threats = 0
+    building_moves = 0
+
     for dh, dw in _DIRECTIONS:
         count, open_ends, has_gap = _scan_direction(board, move, player, dh, dw)
         s = _line_score(count, open_ends, has_gap)
         total += s
-        if s >= _SCORE_GAP_THREE:  # open three, gap three, or better
+        if s >= _SCORE_GAP_THREE:
             strong_threats += 1
-    # Fork bonus: two or more strong threats at once
+        elif s >= _SCORE_BLOCKED_THREE:
+            moderate_threats += 1
+        elif s >= _SCORE_OPEN_TWO:
+            building_moves += 1
+
+    # --- Multi-directional combination bonuses (most important first) ---
     if strong_threats >= 2:
         total += _SCORE_FORK_BONUS
+    elif strong_threats >= 1 and moderate_threats >= 1:
+        total += _SCORE_COMBO_BONUS
+    elif moderate_threats >= 2:
+        total += _SCORE_MODERATE_FORK
+    elif building_moves >= 2:
+        total += _SCORE_PREFORK_SETUP
+    elif building_moves >= 1 and moderate_threats >= 1:
+        total += _SCORE_SETUP_COMBO
+
     return total, strong_threats
 
 
@@ -198,6 +236,138 @@ def _move_heuristic_score(board, move):
     def_score, _ = _evaluate_move(board, move, opp)
 
     return atk_score + _DEFENCE_MULTIPLIER * def_score
+
+
+# ---------------------------------------------------------------------------
+# Board-level threat scanning: what threats already exist on the board?
+# Used by the value function to assess initiative and chain potential.
+# ---------------------------------------------------------------------------
+
+def _count_board_threats(board, player):
+    """Scan the board for existing threat patterns of `player`.
+
+    Returns a dict with counts of each threat type found on the board.
+    Now detects BOTH contiguous patterns AND gap patterns (e.g. ●_●●).
+    """
+    states = board.states
+    width, height = board.width, board.height
+    threats = {'open_four': 0, 'half_four': 0, 'open_three': 0,
+               'gap_three': 0, 'blocked_three': 0, 'open_two': 0}
+
+    visited_contig = set()
+    visited_gap = set()
+
+    for pos, p in states.items():
+        if p != player:
+            continue
+        h = pos // width
+        w = pos % width
+        for dh, dw in _DIRECTIONS:
+            # --- 1) Contiguous scan (forward only to avoid double-count) ---
+            key_c = (pos, dh, dw)
+            if key_c not in visited_contig:
+                count = 1
+                r, c = h + dh, w + dw
+                while (0 <= r < height and 0 <= c < width and
+                       states.get(r * width + c) == player):
+                    visited_contig.add((r * width + c, dh, dw))
+                    count += 1
+                    r += dh
+                    c += dw
+
+                if count >= 2:
+                    open_ends = 0
+                    if (0 <= r < height and 0 <= c < width and
+                            states.get(r * width + c) is None):
+                        open_ends += 1
+                    br, bc = h - dh, w - dw
+                    if (0 <= br < height and 0 <= bc < width and
+                            states.get(br * width + bc) is None):
+                        open_ends += 1
+
+                    if count >= 4:
+                        if open_ends >= 2:
+                            threats['open_four'] += 1
+                        elif open_ends >= 1:
+                            threats['half_four'] += 1
+                    elif count == 3:
+                        if open_ends >= 2:
+                            threats['open_three'] += 1
+                        elif open_ends >= 1:
+                            threats['blocked_three'] += 1
+                    elif count == 2:
+                        if open_ends >= 2:
+                            threats['open_two'] += 1
+
+            # --- 2) Gap pattern scan: ●_●, ●_●●, ●●_● ---
+            # Look for a gap (empty cell) immediately forward, then stones.
+            gr, gc = h + dh, w + dw
+            if not (0 <= gr < height and 0 <= gc < width):
+                continue
+            gap_pos = gr * width + gc
+            if states.get(gap_pos) is not None:
+                continue  # not a gap
+            # Check for stones after the gap
+            gr2, gc2 = gr + dh, gc + dw
+            gap_key = (pos, gap_pos, dh, dw)
+            if gap_key in visited_gap:
+                continue
+            visited_gap.add(gap_key)
+
+            gap_count = 1  # the starting stone
+            # Count stones after the gap
+            sr, sc = gr2, gc2
+            while (0 <= sr < height and 0 <= sc < width and
+                   states.get(sr * width + sc) == player):
+                gap_count += 1
+                sr += dh
+                sc += dw
+            # Count stones before the starting stone (backward)
+            br, bc = h - dh, w - dw
+            while (0 <= br < height and 0 <= bc < width and
+                   states.get(br * width + bc) == player):
+                gap_count += 1
+                br -= dh
+                bc -= dw
+
+            if gap_count < 3:
+                continue  # need at least 3 stones with gap to be dangerous
+
+            # Check open ends around the full gap pattern
+            gap_open = 0
+            if (0 <= sr < height and 0 <= sc < width and
+                    states.get(sr * width + sc) is None):
+                gap_open += 1
+            if (0 <= br < height and 0 <= bc < width and
+                    states.get(br * width + bc) is None):
+                gap_open += 1
+
+            if gap_count >= 4:
+                threats['half_four'] += 1
+            elif gap_count == 3:
+                threats['gap_three'] += 1
+
+    return threats
+
+
+def _best_opponent_move_score(board):
+    """1-ply urgency check: find the opponent's strongest available move.
+
+    This detects imminent threats like ○○●○●●○○ where the opponent
+    can create an open four on their next turn.  Returns the highest
+    score any single opponent move would achieve.
+    """
+    opp = board.players[0] if board.current_player == board.players[1] \
+        else board.players[1]
+    candidates = _get_candidate_moves(board, radius=2)
+    best = 0
+    for m in candidates:
+        score, _ = _evaluate_move(board, m, opp)
+        if score > best:
+            best = score
+            if best >= _SCORE_WIN:  # can't get worse, stop early
+                break
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +410,14 @@ def heuristic_policy_value_fn(board):
 
     Scores each candidate move with the pattern engine, converts to
     a probability distribution (prior), and returns a positional value
-    in [-1, 1].  This replaces the expensive full-game rollout with a
-    single O(candidates × 4-directions) scan — typically ~50-100× faster.
+    in [-1, 1].
+
+    Enhanced with:
+      - Multi-level combination bonus (fork, combo, pre-fork setup)
+      - Board-level threat context (existing open/gap threes boost urgency)
+      - 1-ply opponent urgency check (detects imminent open-four threats)
+      - Sharper priors via power-law scaling
+      - Initiative-aware value estimation
     """
     candidates = _get_candidate_moves(board, radius=2)
     if not candidates:
@@ -250,53 +426,114 @@ def heuristic_policy_value_fn(board):
     curr = board.current_player
     opp = board.players[0] if curr == board.players[1] else board.players[1]
 
+    # --- Scan existing board threats for context ---
+    curr_threats = _count_board_threats(board, curr)
+    opp_threats = _count_board_threats(board, opp)
+    has_existing_strong = (curr_threats['open_three'] > 0 or
+                           curr_threats['gap_three'] > 0)
+    opp_has_strong = (opp_threats['open_three'] > 0 or
+                      opp_threats['gap_three'] > 0)
+
+    # --- 1-ply urgency check: what can the opponent do next turn? ---
+    opp_best = _best_opponent_move_score(board)
+
     scores = []
+    atk_scores = []
+    def_scores = []
     best_atk = 0
     best_def = 0
     for m in candidates:
-        atk, _ = _evaluate_move(board, m, curr)
-        dfn, _ = _evaluate_move(board, m, opp)
+        atk, atk_st = _evaluate_move(board, m, curr)
+        dfn, def_st = _evaluate_move(board, m, opp)
+
+        # Context bonus: if we already have an open/gap three elsewhere,
+        # ANY move that creates another threat is extremely valuable
+        # because the opponent can't block two threats at once.
+        if has_existing_strong and atk >= _SCORE_OPEN_THREE:
+            atk += _SCORE_COMBO_BONUS
+        elif has_existing_strong and atk >= _SCORE_BLOCKED_THREE:
+            atk += _SCORE_MODERATE_FORK
+
+        # If opponent has strong threats, urgently boost blocking moves.
+        if opp_has_strong and dfn >= _SCORE_OPEN_THREE:
+            dfn += _SCORE_HALF_FOUR
+        elif opp_has_strong and dfn >= _SCORE_BLOCKED_THREE:
+            dfn += _SCORE_BLOCKED_THREE  # moderate urgency
+
+        # 1-ply urgency: if opponent can create open four next turn,
+        # any blocking move (that reduces their best threat) gets a
+        # big defense boost.
+        if opp_best >= _SCORE_OPEN_FOUR and dfn >= _SCORE_HALF_FOUR:
+            dfn += _SCORE_COMBO_BONUS  # MUST block or lose
+
         combined = atk + _DEFENCE_MULTIPLIER * dfn
         scores.append(combined)
+        atk_scores.append(atk)
+        def_scores.append(dfn)
         best_atk = max(best_atk, atk)
         best_def = max(best_def, dfn)
 
     scores = np.array(scores, dtype=np.float64)
     scores = scores + 1.0  # floor so zero-score moves still get explored
 
-    # Softmax-like conversion to probabilities
+    # Sharper priors via power-law scaling.
     log_scores = np.log(scores + 1e-10)
     log_scores -= np.max(log_scores)
-    probs = np.exp(log_scores)
+    sharpened = log_scores * 1.5
+    probs = np.exp(sharpened)
     probs /= probs.sum()
 
     action_probs = list(zip(candidates, probs))
 
-    # Positional value estimate from the pattern landscape.
+    # --- Value estimation: aggressive and urgency-aware ---
     value = 0.0
     if best_atk >= _SCORE_WIN:
         value = 1.0
     elif best_def >= _SCORE_WIN:
         value = -1.0
     elif best_atk >= _SCORE_OPEN_FOUR:
-        value = 0.8
+        value = 0.9
     elif best_def >= _SCORE_OPEN_FOUR:
-        value = -0.8
+        value = -0.85
     elif best_atk >= _SCORE_FORK_BONUS:
-        value = 0.6
+        value = 0.75
     elif best_def >= _SCORE_FORK_BONUS:
-        value = -0.6
+        value = -0.65
+    elif best_atk >= _SCORE_COMBO_BONUS:
+        value = 0.55
+    elif best_def >= _SCORE_COMBO_BONUS:
+        value = -0.45
     elif best_atk >= _SCORE_OPEN_THREE:
-        value = 0.3
+        value = 0.35
     elif best_def >= _SCORE_OPEN_THREE:
         value = -0.3
+    elif best_atk >= _SCORE_PREFORK_SETUP:
+        value = 0.15
+    elif best_def >= _SCORE_PREFORK_SETUP:
+        value = -0.1
     else:
-        # Subtle advantage from material balance of threats.
-        atk_sum = sum(1 for s in scores if s > _SCORE_OPEN_TWO)
-        def_total = sum(1 for m in candidates
-                        if _evaluate_move(board, m, opp)[0] >= _SCORE_OPEN_TWO)
-        if atk_sum + def_total > 0:
-            value = 0.1 * (atk_sum - def_total) / (atk_sum + def_total + 1)
+        n_atk = sum(1 for s in atk_scores if s >= _SCORE_OPEN_TWO)
+        n_def = sum(1 for s in def_scores if s >= _SCORE_OPEN_TWO)
+        if n_atk + n_def > 0:
+            value = 0.08 * (n_atk - n_def) / (n_atk + n_def + 1)
+
+    # 1-ply urgency override: if opponent can create open four or fork
+    # next turn, the position is dire regardless of our own threats.
+    if opp_best >= _SCORE_OPEN_FOUR:
+        value = min(value, -0.85)
+    elif opp_best >= _SCORE_FORK_BONUS:
+        value = min(value, -0.7)
+    elif opp_best >= _SCORE_OPEN_THREE:
+        value = min(value, -0.35)
+
+    # Initiative bonus from existing board threats.
+    initiative = (curr_threats['open_three'] * 0.15
+                  + curr_threats['gap_three'] * 0.12
+                  + curr_threats['open_two'] * 0.03
+                  - opp_threats['open_three'] * 0.12
+                  - opp_threats['gap_three'] * 0.10
+                  - opp_threats['open_two'] * 0.02)
+    value = max(-1.0, min(1.0, value + initiative))
 
     return action_probs, value
 
