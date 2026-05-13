@@ -10,6 +10,6 @@
   "norm": "ln",
   "act": "gelu",
   "d4_randomisation": true,
-  "saved_at": "2026-05-13T02:21:00+0000",
+  "saved_at": "2026-05-13T03:21:00+0000",
   "git_sha": "unknown"
 }
