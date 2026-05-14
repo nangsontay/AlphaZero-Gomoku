@@ -116,7 +116,7 @@ class MLPNet(nn.Module):
     """
 
     def __init__(self, board_width, board_height, in_channels=4,
-                 embed_dim=24, hidden_dim=768, num_blocks=3,
+                 embed_dim=16, hidden_dim=256, num_blocks=5,
                  value_hidden=128, dropout=0.1, norm="ln", act="gelu",
                  bottleneck_ratio=4):
         super().__init__()
