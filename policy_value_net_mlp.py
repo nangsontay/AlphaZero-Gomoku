@@ -82,16 +82,22 @@ class PerCellEmbed(nn.Module):
 
 
 class MLPResBlock(nn.Module):
-    """Pre-norm residual block: x + Linear(GELU(LN(Linear(GELU(LN(x))))))."""
+    """Bottleneck pre-norm residual block.
 
-    def __init__(self, dim, dropout=0.1, norm="ln", act="gelu"):
+    x + Linear(inner→dim, GELU(LN(Linear(dim→inner, GELU(LN(x))))))
+    With bottleneck_ratio=4: dim→dim//4→dim, reducing params ~4× per block.
+    """
+
+    def __init__(self, dim, dropout=0.1, norm="ln", act="gelu",
+                 bottleneck_ratio=4):
         super().__init__()
+        inner = max(64, dim // bottleneck_ratio)
         Norm = nn.LayerNorm if norm == "ln" else nn.BatchNorm1d
         Act = nn.GELU if act == "gelu" else nn.ReLU
         self.n1 = Norm(dim)
-        self.n2 = Norm(dim)
-        self.fc1 = nn.Linear(dim, dim)
-        self.fc2 = nn.Linear(dim, dim)
+        self.n2 = Norm(inner)
+        self.fc1 = nn.Linear(dim, inner)
+        self.fc2 = nn.Linear(inner, dim)
         self.act = Act()
         self.drop = nn.Dropout(dropout)
 
@@ -105,12 +111,14 @@ class MLPResBlock(nn.Module):
 class MLPNet(nn.Module):
     """Pure-MLP policy-value net for 15x15 Gomoku.
 
-    Approximate parameter count: ~40.1M (see Appendix C of the v2 plan).
+    Approximate parameter count: ~5.5M (bottleneck config, optimised for 15x15).
+    Uses bottleneck ResBlocks (dim→dim//4→dim) to cut per-block params ~4×.
     """
 
     def __init__(self, board_width, board_height, in_channels=4,
-                 embed_dim=32, hidden_dim=1536, num_blocks=6,
-                 value_hidden=256, dropout=0.1, norm="ln", act="gelu"):
+                 embed_dim=24, hidden_dim=768, num_blocks=3,
+                 value_hidden=128, dropout=0.1, norm="ln", act="gelu",
+                 bottleneck_ratio=4):
         super().__init__()
         self.board_width = int(board_width)
         self.board_height = int(board_height)
@@ -122,6 +130,7 @@ class MLPNet(nn.Module):
         self.norm = str(norm)
         self.act = str(act)
         self.board_size = self.board_width * self.board_height
+        self.bottleneck_ratio = int(bottleneck_ratio)
 
         self.embed = PerCellEmbed(self.in_channels, self.embed_dim)
 
@@ -134,7 +143,8 @@ class MLPNet(nn.Module):
             Act(),
         )
         self.trunk = nn.Sequential(*[
-            MLPResBlock(self.hidden_dim, dropout, norm, act)
+            MLPResBlock(self.hidden_dim, dropout, norm, act,
+                        bottleneck_ratio=self.bottleneck_ratio)
             for _ in range(self.num_blocks)
         ])
         self.head_norm = Norm(self.hidden_dim)
@@ -162,10 +172,10 @@ class MLPNet(nn.Module):
                 f"MLPNet expected H={self.board_height}, W={self.board_width}; "
                 f"got H={x.size(2)}, W={x.size(3)}."
             )
-        x = self.embed(x)                                  # (N, 225*32)
-        x = self.stem(x)                                   # (N, 1536)
-        x = self.trunk(x)                                  # (N, 1536)
-        x = self.head_norm(x)                              # (N, 1536)
+        x = self.embed(x)                                  # (N, 225*embed)
+        x = self.stem(x)                                   # (N, hidden)
+        x = self.trunk(x)                                  # (N, hidden)
+        x = self.head_norm(x)                              # (N, hidden)
         # Cast logits to float32 BEFORE log_softmax so AMP/FP16 paths stay
         # numerically stable.
         log_p = F.log_softmax(self.policy_head(x).float(), dim=1)   # (N, 225)
@@ -180,8 +190,8 @@ class PolicyValueNet:
     def __init__(self, board_width, board_height, model_file=None,
                  use_gpu=False, in_channels=4,
                  # MLP-specific knobs (callers may ignore them):
-                 embed_dim=32, hidden_dim=1536, num_blocks=6,
-                 value_hidden=256, dropout=0.1, norm="ln", act="gelu",
+                 embed_dim=24, hidden_dim=768, num_blocks=3,
+                 value_hidden=128, dropout=0.1, norm="ln", act="gelu",
                   use_amp=None, sym_loss_weight=0.0,
                   tactic_loss_weight=0.25,
                  # v2 addition (§5): control random D4 in policy_value_fn.
