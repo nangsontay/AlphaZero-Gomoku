@@ -384,9 +384,9 @@ class MCTSPlayer(object):
             else:
                 # with the default temp=1e-3, it is almost equivalent
                 # to choosing the move with the highest prob
-                move = np.random.choice(acts, p=probs)
+                move = acts[np.argmax(probs)]
                 # reset the root node
-                self.mcts.update_with_move(-1)
+                self.mcts.update_with_move(move)
 #                location = board.move_to_location(move)
 #                print("AI move: %d,%d\n" % (location[0], location[1]))
 
