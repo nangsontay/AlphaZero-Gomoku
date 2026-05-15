@@ -299,7 +299,7 @@ class PolicyValueNet:
     def __init__(self, board_width, board_height, model_file=None,
                  use_gpu=False, in_channels=4,
                  # MLP-specific knobs (callers may ignore them):
-                 embed_dim=24, hidden_dim=768, num_blocks=3,
+                 embed_dim=8, hidden_dim=384, num_blocks=4,
                  value_hidden=128, dropout=0.1, norm="ln", act="gelu",
                  use_amp=None, sym_loss_weight=0.0,
                  tactic_loss_weight=0.25, tactic_sample_weight=1.5,

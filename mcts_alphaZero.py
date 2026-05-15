@@ -394,7 +394,7 @@ class MCTSPlayer(object):
             else:
                 # with the default temp=1e-3, it is almost equivalent
                 # to choosing the move with the highest prob
-                move = np.random.choice(acts, p=probs)
+                move = acts[np.argmax(probs)]
                 # Reuse subtree: advance tree by the move we chose.
                 self.mcts.update_with_move(move)
 #                location = board.move_to_location(move)
