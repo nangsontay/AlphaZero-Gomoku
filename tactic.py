@@ -23,12 +23,87 @@ import numpy as np
 
 # Import the pattern-scoring primitives from mcts_pure.
 # mcts_pure does NOT import from tactic, so no circular dependency.
-from mcts_pure import (
-    _scan_direction, _line_score, _DIRECTIONS,
-    _SCORE_WIN, _SCORE_OPEN_FOUR, _SCORE_HALF_FOUR,
-    _SCORE_OPEN_THREE, _SCORE_BLOCKED_THREE, _SCORE_GAP_THREE,
-    _SCORE_OPEN_TWO,
-)
+# -----------------------------------------------------------------------
+# ENGINE NHẬN DIỆN MẪU ĐỘC LẬP (PATTERN-SCORING ENGINE)
+# -----------------------------------------------------------------------
+_DIRECTIONS = [(0, 1), (1, 0), (1, 1), (1, -1)]
+
+_SCORE_WIN         = 1000000   # 5-in-a-row — instant win
+_SCORE_OPEN_FOUR   = 10000     # 4-in-a-row, both ends open
+_SCORE_HALF_FOUR   = 1000      # 4-in-a-row, one end open
+_SCORE_GAP_THREE   = 900       # 3-in-a-row with a gap
+_SCORE_OPEN_THREE  = 100       # 3-in-a-row, both ends open
+_SCORE_BLOCKED_THREE= 10       # 3-in-a-row, one end blocked
+_SCORE_OPEN_TWO    = 5         # 2-in-a-row, both ends open
+
+def _scan_direction(board, move, player, dh, dw):
+    """
+    Quét từ vị trí 'move' theo hướng (dh, dw).
+    Trả về (count, open_ends, has_gap)
+    """
+    h = move // board.width
+    w = move % board.width
+    states = board.states
+    
+    count = 1
+    open_ends = 0
+    has_gap = False
+    
+    def scan_one_side(step_h, step_w):
+        nonlocal count, has_gap
+        r, c = h + step_h, w + step_w
+        side_count = 0
+        gap = False
+        open_end = 0
+        
+        for _ in range(4): # Chỉ quét tối đa 4 ô
+            if not (0 <= r < board.height and 0 <= c < board.width):
+                break # Đụng tường
+            
+            p = states.get(r * board.width + c)
+            if p == player:
+                side_count += 1
+            elif p is None or p == 0: # Ô trống
+                if not gap:
+                    # Nhìn xuyên qua ô trống xem có quân mình không (Gap)
+                    r2, c2 = r + step_h, c + step_w
+                    if 0 <= r2 < board.height and 0 <= c2 < board.width and states.get(r2 * board.width + c2) == player:
+                        gap = True
+                    else:
+                        open_end = 1
+                        break
+                else:
+                    open_end = 1
+                    break
+            else: # Đụng quân địch
+                break
+            
+            r += step_h
+            c += step_w
+        return side_count, open_end, gap
+
+    count1, open1, gap1 = scan_one_side(dh, dw)
+    count2, open2, gap2 = scan_one_side(-dh, -dw)
+    
+    count += count1 + count2
+    open_ends = open1 + open2
+    has_gap = gap1 or gap2
+    
+    return count, open_ends, has_gap
+
+def _line_score(count, open_ends, has_gap):
+    """Quy đổi (count, open_ends) ra điểm số phân loại."""
+    if count >= 5: return _SCORE_WIN
+    if count == 4:
+        if open_ends == 2: return _SCORE_OPEN_FOUR
+        if open_ends == 1: return _SCORE_HALF_FOUR
+    if count == 3:
+        if has_gap and open_ends > 0: return _SCORE_GAP_THREE
+        if open_ends == 2: return _SCORE_OPEN_THREE
+        if open_ends >= 1: return _SCORE_BLOCKED_THREE
+    if count == 2 and open_ends == 2:
+        return _SCORE_OPEN_TWO
+    return 0
 
 
 # -----------------------------------------------------------------------
