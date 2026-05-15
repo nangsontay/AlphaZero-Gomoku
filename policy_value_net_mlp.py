@@ -109,8 +109,8 @@ class MLPNet(nn.Module):
     """
 
     def __init__(self, board_width, board_height, in_channels=4,
-                 embed_dim=32, hidden_dim=1536, num_blocks=6,
-                 value_hidden=256, dropout=0.1, norm="ln", act="gelu"):
+                 embed_dim=8, hidden_dim=512, num_blocks=4,
+                 value_hidden=128, dropout=0.1, norm="ln", act="gelu"):
         super().__init__()
         self.board_width = int(board_width)
         self.board_height = int(board_height)
