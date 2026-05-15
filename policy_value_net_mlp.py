@@ -582,8 +582,22 @@ class PolicyValueNet:
         return act_probs, value
 
     def train_step(self, state_batch, mcts_probs, winner_batch, lr,
-                   tactic_batch=None, tactic_mask=None):
-        """perform a training step (v2 §3.4 with E04 finite-loss guard)."""
+                   tactic_batch=None, tactic_mask=None, value_mask=None):
+        """perform a training step (v2 §3.4 with E04 finite-loss guard).
+
+        Parameters
+        ----------
+        tactic_batch : optional per-sample tactic label vector.
+        tactic_mask  : optional per-sample 0/1 mask. Rows with mask == 0 do
+            NOT contribute to the auxiliary tactic BCE loss and do NOT receive
+            the `tactic_sample_weight` upweight on the policy/value losses.
+        value_mask   : optional per-sample 0/1 mask gating the value loss.
+            Used for tactical pretraining where non-forced samples have an
+            unknown game-theoretic value and must not pull the value head
+            toward 0. When None (default), every row contributes to the
+            value loss with full weight — preserves the original behaviour
+            for self-play 3-/4-tuples.
+        """
         self.policy_value_net.train()
         state_batch = self._to_tensor(state_batch)
         mcts_probs = self._to_tensor(mcts_probs)
@@ -594,6 +608,9 @@ class PolicyValueNet:
             tactic_targets = self._to_tensor(tactic_batch)
             if tactic_mask is not None:
                 tactic_mask_tensor = self._to_tensor(tactic_mask).view(-1, 1)
+        value_mask_tensor = None
+        if value_mask is not None:
+            value_mask_tensor = self._to_tensor(value_mask).view(-1)
 
         self.optimizer.zero_grad(set_to_none=True)
         set_learning_rate(self.optimizer, lr)
@@ -610,12 +627,24 @@ class PolicyValueNet:
                         torch.zeros_like(tactic_for_weight),
                     )
                 tactic_max = tactic_for_weight.max(dim=1).values.clamp(0.0, 1.0)
+                # The tactical upweight only applies to rows that carry real
+                # tactic content (max > 0) AND have tactic_mask > 0. For
+                # everything else fall back to sample_w == 1.0 so global loss
+                # magnitude is invariant to mask ratio.
                 sample_w = (1.0 + self.tactic_sample_weight * tactic_max).detach()
                 if tactic_mask_tensor is not None:
                     mask_1d = tactic_mask_tensor.view(-1)
                     sample_w = torch.where(
                         mask_1d > 0.5, sample_w, torch.ones_like(sample_w))
-            value_loss = (sample_w * (v.view(-1) - winner_batch).pow(2)).mean()
+            value_err = sample_w * (v.view(-1) - winner_batch).pow(2)
+            if value_mask_tensor is not None:
+                # Gated mean over rows whose value targets are real (mask=1).
+                # `clamp_min(1.0)` keeps the gradient finite when every row
+                # is masked off — in that edge case value_loss == 0.
+                value_loss = (value_mask_tensor * value_err).sum() / \
+                    value_mask_tensor.sum().clamp_min(1.0)
+            else:
+                value_loss = value_err.mean()
             policy_loss = -(sample_w * torch.sum(mcts_probs * log_p, dim=1)).mean()
             loss = value_loss + policy_loss
             if tactic_targets is not None and self.tactic_loss_weight > 0.0:
@@ -623,6 +652,12 @@ class PolicyValueNet:
                     tactic_logits, tactic_targets, reduction='none')
                 if tactic_mask_tensor is not None:
                     tactic_loss_raw = tactic_loss_raw * tactic_mask_tensor
+                    # Normalise by the number of MASKED elements so the
+                    # auxiliary loss magnitude is invariant to how many rows
+                    # in the batch are labelled. When no rows are labelled,
+                    # `tactic_mask_tensor.sum() == 0` and the clamp keeps the
+                    # division stable; numerator is also 0, so the loss
+                    # contributes nothing.
                     valid_elements = tactic_mask_tensor.sum() * tactic_loss_raw.size(1)
                     tactic_loss = tactic_loss_raw.sum() / valid_elements.clamp_min(1.0)
                 else:

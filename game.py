@@ -86,7 +86,11 @@ class Board(object):
             # indicate the last move location
             square_state[2][self.last_move // self.width,
                             self.last_move % self.height] = 1.0
-        if len(self.states) % 2 == 0:
+        # Channel 3 encodes the side to move. Use the actual current_player so
+        # the encoding is correct even when start_player != 0 (i.e. when move
+        # parity doesn't line up with the canonical "first player to move"
+        # convention).
+        if self.current_player == self.players[0]:
             square_state[3][:, :] = 1.0  # indicate the colour to play
         return square_state
 

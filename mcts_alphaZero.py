@@ -6,8 +6,6 @@ network to guide the tree search and evaluate the leaf nodes
 
 import numpy as np
 
-from tactic import apply_tactical_prior_bonus
-
 
 def softmax(x):
     probs = np.exp(x - np.max(x))
@@ -182,7 +180,7 @@ class MCTS(object):
 
     def __init__(self, policy_value_fn, policy_value_batch_fn=None,
                   c_puct=3.0, n_playout=10000, vl_k=4, n_vl=1.0,
-                  max_oversample=3, tactic_prior_weight=0.35):
+                  max_oversample=3):
         """
         policy_value_fn: a function that takes in a board state and outputs
             a list of (action, probability) tuples and also a score in [-1, 1]
@@ -202,23 +200,7 @@ class MCTS(object):
         self._vl_k = max(1, int(vl_k))
         self._n_vl = float(n_vl)
         self._max_oversample = max(1, int(max_oversample))
-        self._tactic_prior_weight = max(0.0, float(tactic_prior_weight))
         self._root_noise_applied = False
-
-    def _playout(self, state):
-        """Run one compatibility playout through the batched implementation."""
-        old_n_playout = self._n_playout
-        old_vl_k = self._vl_k
-        old_n_vl = self._n_vl
-        try:
-            self._n_playout = 1
-            self._vl_k = 1
-            self._n_vl = 0.0
-            self.get_move_probs(state, temp=1.0)
-        finally:
-            self._n_playout = old_n_playout
-            self._vl_k = old_vl_k
-            self._n_vl = old_n_vl
 
     def get_move_probs(self, state, temp=1e-3,
                        dirichlet_alpha=None, noise_eps=0.0):
@@ -272,7 +254,7 @@ class MCTS(object):
                 for (leaf, sim, path), (action_priors, value) in zip(
                         nn_leaves, eval_results):
                     if leaf.is_leaf():
-                        leaf.expand(self._with_tactical_prior(action_priors, sim))
+                        leaf.expand(action_priors)
                         if (leaf.is_root() and dirichlet_alpha is not None and
                                 noise_eps > 0 and not self._root_noise_applied):
                             leaf.apply_dirichlet_noise(dirichlet_alpha, noise_eps)
@@ -314,11 +296,6 @@ class MCTS(object):
             results.append(([(a, float(priors[a])) for a in legal], float(value)))
         return results
 
-    def _with_tactical_prior(self, action_priors, board):
-        """Apply a soft tactical prior bonus before node expansion."""
-        return apply_tactical_prior_bonus(
-            action_priors, board, bonus_weight=self._tactic_prior_weight)
-
     def _backup_and_revert(self, path, leaf_value):
         """Revert virtual loss and back up values along a selected path."""
         if not path:
@@ -354,16 +331,14 @@ class MCTSPlayer(object):
     def __init__(self, policy_value_function, policy_value_batch_function=None,
                   c_puct=3.0, n_playout=2000, is_selfplay=0,
                   dirichlet_alpha=0.05, noise_eps=0.25,
-                  vl_k=4, n_vl=1.0, max_oversample=3,
-                  tactic_prior_weight=0.35):
+                  vl_k=4, n_vl=1.0, max_oversample=3):
         self.mcts = MCTS(policy_value_function,
                          policy_value_batch_fn=policy_value_batch_function,
                          c_puct=c_puct,
                          n_playout=n_playout,
                           vl_k=vl_k,
                           n_vl=n_vl,
-                          max_oversample=max_oversample,
-                          tactic_prior_weight=tactic_prior_weight)
+                          max_oversample=max_oversample)
         self._is_selfplay = is_selfplay
         self._dirichlet_alpha = float(dirichlet_alpha)
         self._noise_eps = float(noise_eps)
@@ -386,15 +361,42 @@ class MCTSPlayer(object):
                     noise_eps=self._noise_eps)
             else:
                 acts, probs = self.mcts.get_move_probs(board, temp)
-            move_probs[list(acts)] = probs
+            acts = list(acts)
+            if len(acts) == 0:
+                # MCTS produced no candidates (e.g. late-game when every leaf
+                # expansion fell back to a terminal or the root's only legal
+                # actions immediately terminate). Fall back to a uniform
+                # random legal move so the game can finish instead of
+                # crashing on `np.random.choice([], ...)` / `acts[argmax]`.
+                print(
+                    "WARNING: MCTS returned no actions; falling back to a "
+                    "uniform random legal move (legal_count={}).".format(
+                        len(sensible_moves)), flush=True)
+                move = int(np.random.choice(sensible_moves))
+                # Leave move_probs as a zero vector — there is no policy
+                # signal to expose for this state. Resync the search tree so
+                # subsequent calls reflect the played move.
+                self.mcts.update_with_move(move)
+                if return_prob:
+                    return move, move_probs
+                return move
+            probs = np.asarray(probs, dtype=np.float64)
+            move_probs[acts] = probs
             if self._is_selfplay:
-                move = np.random.choice(acts, p=probs)
+                # `np.random.choice` requires p to sum to 1.0 within tolerance.
+                # Renormalise defensively to absorb floating-point drift.
+                total = float(probs.sum())
+                if total <= 0.0 or not np.isfinite(total):
+                    move = int(np.random.choice(acts))
+                else:
+                    probs_norm = probs / total
+                    move = int(np.random.choice(acts, p=probs_norm))
                 # update the root node and reuse the search tree
                 self.mcts.update_with_move(move)
             else:
                 # with the default temp=1e-3, it is almost equivalent
                 # to choosing the move with the highest prob
-                move = acts[np.argmax(probs)]
+                move = int(acts[int(np.argmax(probs))])
                 # Reuse subtree: advance tree by the move we chose.
                 self.mcts.update_with_move(move)
 #                location = board.move_to_location(move)

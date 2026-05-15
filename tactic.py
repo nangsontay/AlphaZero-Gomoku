@@ -249,37 +249,6 @@ def get_tactic_label_vector(board):
     return labels
 
 
-def apply_tactical_prior_bonus(action_priors, board, bonus_weight=0.35,
-                               epsilon=1e-8):
-    """Blend tactical scores into policy priors with a soft multiplicative bonus.
-
-    The relative ordering from the neural policy is preserved when no tactical
-    signal exists. With signals, priors are multiplied by
-    `1 + bonus_weight * score` and renormalized over legal actions.
-    """
-    action_priors = list(action_priors)
-    if not action_priors or bonus_weight <= 0:
-        return action_priors
-
-    scores = get_tactic_scores(board)
-    if not scores:
-        return action_priors
-
-    adjusted = []
-    total = 0.0
-    for action, prior in action_priors:
-        prior = max(float(prior), float(epsilon))
-        multiplier = 1.0 + float(bonus_weight) * float(scores.get(int(action), 0.0))
-        value = prior * multiplier
-        adjusted.append((int(action), value))
-        total += value
-
-    if total <= 0.0:
-        uniform = 1.0 / len(adjusted)
-        return [(action, uniform) for action, _ in adjusted]
-    return [(action, value / total) for action, value in adjusted]
-
-
 def get_tactic_forced_move(board):
     """
     Dựa trên strategy.md: Quét tìm các nước đi bắt buộc (Win hoặc Defense Block).

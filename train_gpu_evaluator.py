@@ -108,47 +108,64 @@ def set_cpu_threads(n=1):
 
 
 def get_equi_data(play_data, board_width, board_height):
+    """D4-augment training samples.
+
+    Supports three input tuple shapes (backward-compatible):
+      - 3-tuple: (state, mcts_prob, winner)
+      - 4-tuple: (state, mcts_prob, winner, tactic_label)        # self-play B1
+      - 5-tuple: (state, mcts_prob, winner, value_mask, tactic)  # pretraining
+
+    The scalar `winner` / `value_mask` carry over unchanged through each D4
+    rotation+flip; only board-shaped fields (state, mcts_prob, tactic_label)
+    are transformed.
+    """
     extend_data = []
     for sample in play_data:
         state, mcts_prob, winner = sample[:3]
-        tactic_label = sample[3] if len(sample) > 3 else None
+        if len(sample) >= 5:
+            value_mask = sample[3]
+            tactic_label = sample[4]
+        elif len(sample) == 4:
+            value_mask = None
+            tactic_label = sample[3]
+        else:
+            value_mask = None
+            tactic_label = None
         for i in range(4):
             equi_state = np.array([np.rot90(s, i) for s in state])
             equi_mcts_prob = np.rot90(
                 mcts_prob.reshape(board_height, board_width), i
             )
-            if tactic_label is None:
-                extend_data.append((
-                    equi_state,
-                    equi_mcts_prob.flatten(),
-                    winner,
-                ))
-            else:
+            if tactic_label is not None:
                 equi_tactic = np.rot90(
                     tactic_label.reshape(board_height, board_width), i
                 )
-                extend_data.append((
-                    equi_state,
-                    equi_mcts_prob.flatten(),
-                    winner,
-                    equi_tactic.flatten(),
-                ))
+            else:
+                equi_tactic = None
+
+            def _emit(s_arr, p_arr, t_arr):
+                if t_arr is None:
+                    extend_data.append((s_arr, p_arr, winner))
+                elif value_mask is None:
+                    extend_data.append((s_arr, p_arr, winner, t_arr))
+                else:
+                    extend_data.append((
+                        s_arr, p_arr, winner, value_mask, t_arr))
+
+            _emit(
+                equi_state,
+                equi_mcts_prob.flatten(),
+                equi_tactic.flatten() if equi_tactic is not None else None,
+            )
             equi_state_flip = np.array([np.fliplr(s) for s in equi_state])
             equi_mcts_prob_flip = np.fliplr(equi_mcts_prob)
-            if tactic_label is None:
-                extend_data.append((
-                    equi_state_flip,
-                    equi_mcts_prob_flip.flatten(),
-                    winner,
-                ))
-            else:
-                equi_tactic_flip = np.fliplr(equi_tactic)
-                extend_data.append((
-                    equi_state_flip,
-                    equi_mcts_prob_flip.flatten(),
-                    winner,
-                    equi_tactic_flip.flatten(),
-                ))
+            equi_tactic_flip = (np.fliplr(equi_tactic)
+                                if equi_tactic is not None else None)
+            _emit(
+                equi_state_flip,
+                equi_mcts_prob_flip.flatten(),
+                equi_tactic_flip.flatten() if equi_tactic_flip is not None else None,
+            )
     return extend_data
 
 
@@ -157,7 +174,15 @@ def _generate_tactical_samples_raw(board_width=15, board_height=15, n_in_row=5,
                                    seed=None, forced_ratio=0.6,
                                    block_value_target=0.3,
                                    softmax_temperature=1.0):
-    """Generate un-augmented tactical 4-tuples (state, policy, value, tactic).
+    """Generate un-augmented tactical 5-tuples
+    (state, policy, value, value_mask, tactic).
+
+    `value_mask` is 1.0 for rows whose `value` target is a real game-theoretic
+    signal (forced win / forced block with a known value target) and 0.0 for
+    non-forced rows whose tactic-softmax policy target is meaningful but whose
+    value target is unknown. Trainers must gate the value loss by `value_mask`
+    so unknown-value rows do not pull the value head toward 0 on every
+    tactical position.
 
     This is the picklable, CPU-only core used by both the single-process path
     and the process-pool workers. It must not import or touch CUDA/torch.
@@ -201,6 +226,9 @@ def _generate_tactical_samples_raw(board_width=15, board_height=15, n_in_row=5,
                 continue
             policy_target[int(forced_move)] = 1.0
             value_target = 1.0 if bool(is_win) else float(block_value_target)
+            # Forced rows have a defensible value target: 1.0 for win-in-1
+            # and `block_value_target` for forced blocks. Train value head.
+            value_mask = 1.0
             forced_count += 1
         else:
             if target_non_forced > 0 and non_forced_count >= target_non_forced and forced_count < target_forced:
@@ -220,9 +248,16 @@ def _generate_tactical_samples_raw(board_width=15, board_height=15, n_in_row=5,
             if denom <= 0.0 or not np.isfinite(denom):
                 continue
             policy_target = probs / denom
+            # Non-forced tactical positions have a meaningful policy target
+            # (softmax over tactic scores) but the game-theoretic value is
+            # unknown. Use 0.0 as a placeholder and mask the value loss off
+            # via `value_mask=0` so the value head is not pinned to 0 on
+            # every non-forced tactical sample.
             value_target = 0.0
+            value_mask = 0.0
             non_forced_count += 1
-        samples.append((state, policy_target, value_target, tactic_label))
+        samples.append((state, policy_target, value_target, value_mask,
+                        tactic_label))
     return samples, forced_count, non_forced_count, attempts
 
 
@@ -999,9 +1034,7 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                                  noise_eps=noise_eps,
                                  vl_k=vl_k,
                                  n_vl=n_vl,
-                                  max_oversample=max_oversample,
-                                  tactic_prior_weight=float(args.get(
-                                      "tactic_prior_weight", 0.0)))
+                                 max_oversample=max_oversample)
 
         episode_lens = []
         all_data = []
@@ -1033,11 +1066,35 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                     "eval_requests": client.request_id,
                     "elapsed": time.time() - start,
                 }
-                try:
-                    replay_queue.put(replay_item, timeout=10.0)
-                except queue.Full:
-                    print("[worker {}] replay queue full; dropping completed game".format(
-                        wid), flush=True)
+                # Backpressure: keep retrying with short waits instead of
+                # silently dropping completed games. The trainer drains the
+                # replay queue every iteration of `TrainPipeline.run`, so a
+                # full queue means the trainer is currently busy training;
+                # waiting is the correct behaviour, not data loss. We poll
+                # `shutdown_event` between retries so Ctrl+C still terminates
+                # workers promptly. Stalls log periodically so they are
+                # visible if the trainer is permanently stuck.
+                put_attempt = 0
+                while True:
+                    if shutdown_event is not None and shutdown_event.is_set():
+                        # Caller already asked us to stop; drop this final
+                        # game intentionally rather than blocking forever.
+                        break
+                    try:
+                        replay_queue.put(replay_item, timeout=5.0)
+                        break
+                    except queue.Full:
+                        put_attempt += 1
+                        # Log every ~30s of backpressure so operators can see
+                        # that workers are blocked on the trainer.
+                        if put_attempt % 6 == 1:
+                            print(
+                                "[worker {}] replay queue full; backpressuring "
+                                "completed game (attempt {})".format(
+                                    wid, put_attempt),
+                                flush=True,
+                            )
+                        continue
             else:
                 all_data.extend(augmented)
             game_label = str(games_done) if persistent else "{}/{}".format(games_done, n_games)
@@ -1110,7 +1167,6 @@ class TrainPipeline(object):
                   tactic_pretrain_workers=1,
                   tactic_loss_weight=0.25,
                   pretrain_tactic_loss_weight=0.5,
-                  tactic_prior_weight=0.0,
                   forced_ratio=0.6,
                   block_value_target=0.3,
                   tactic_sample_weight=1.5,
@@ -1145,7 +1201,6 @@ class TrainPipeline(object):
         self.tactic_pretrain_workers = max(1, int(tactic_pretrain_workers))
         self.tactic_loss_weight = max(0.0, float(tactic_loss_weight))
         self.pretrain_tactic_loss_weight = max(0.0, float(pretrain_tactic_loss_weight))
-        self.tactic_prior_weight = max(0.0, float(tactic_prior_weight))
         self.forced_ratio = min(1.0, max(0.0, float(forced_ratio)))
         self.block_value_target = float(block_value_target)
         self.tactic_sample_weight = max(0.0, float(tactic_sample_weight))
@@ -1260,13 +1315,21 @@ class TrainPipeline(object):
                 state_batch = [d[0] for d in mini_batch]
                 policy_batch = [d[1] for d in mini_batch]
                 value_batch = [d[2] for d in mini_batch]
-                tactic_batch = [d[3] for d in mini_batch]
+                # 5-tuple shape after F2: d[3] = value_mask, d[4] = tactic.
+                # 4-tuple fallback (older callers): assume forced/labeled.
+                if len(mini_batch[0]) >= 5:
+                    value_mask = [float(d[3]) for d in mini_batch]
+                    tactic_batch = [d[4] for d in mini_batch]
+                else:
+                    value_mask = [1.0 for _ in mini_batch]
+                    tactic_batch = [d[3] for d in mini_batch]
                 tactic_mask = [1.0 for _ in mini_batch]
                 loss, entropy = self.policy_value_net.train_step(
                     state_batch, policy_batch, value_batch,
                     self.tactic_pretrain_lr,
                     tactic_batch=tactic_batch,
-                    tactic_mask=tactic_mask)
+                    tactic_mask=tactic_mask,
+                    value_mask=value_mask)
                 losses.append(float(loss))
                 if (step + 1) % max(1, self.tactic_pretrain_steps // 5) == 0:
                     print("tactical pretrain step {}/{}: loss={:.6f}, entropy={:.6f}".format(
@@ -1277,11 +1340,46 @@ class TrainPipeline(object):
             len(data), float(np.nanmean(losses)) if losses else 0.0), flush=True)
 
     def save_cpu_model_for_evaluator(self):
+        """Atomically publish a CPU copy of the worker model checkpoint.
+
+        The GPU evaluator hot-reloads `self.worker_model_file` whenever
+        `self.weight_event` is set. Writing in place via `torch.save` is not
+        atomic: the evaluator's `torch.load` can race a partial write and
+        crash with a truncated-tensor error or load corrupted weights. To
+        avoid this we write to a temp file in the same directory, flush + fsync
+        the bytes, then `os.replace` onto the target path. `os.replace` is
+        atomic on POSIX and Windows for files on the same filesystem, so the
+        evaluator either sees the old or the new file, never a partial one.
+        """
         sd = self.policy_value_net.get_policy_param()
         cpu_sd = {}
         for k, v in sd.items():
             cpu_sd[k] = v.detach().cpu() if hasattr(v, "detach") else v
-        torch.save(cpu_sd, self.worker_model_file)
+        target = self.worker_model_file
+        target_dir = os.path.dirname(os.path.abspath(target)) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        # NamedTemporaryFile manages cleanup on failure; we rename on success.
+        # Use a custom tmp name in the same directory so os.replace is atomic.
+        tmp_path = "{}.tmp.{}.{}".format(target, os.getpid(), int(time.time() * 1000))
+        try:
+            with open(tmp_path, "wb") as f:
+                torch.save(cpu_sd, f)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # Some filesystems (e.g. tmpfs) reject fsync; the rename is
+                    # still atomic, so swallow this and continue.
+                    pass
+            os.replace(tmp_path, target)
+        except BaseException:
+            # Best-effort cleanup of the temp file if we failed before replace.
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def setup_shared_memory(self):
         board_size = self.board_width * self.board_height
@@ -1547,7 +1645,6 @@ class TrainPipeline(object):
                 "vl_k": self.vl_k,
                 "n_vl": self.n_vl,
                 "max_oversample": self.max_oversample,
-                "tactic_prior_weight": self.tactic_prior_weight,
                 "temperature_moves": self.temperature_moves,
                 "temp_high": self.temp_high,
                 "temp_low": self.temp_low,
@@ -1759,16 +1856,38 @@ class TrainPipeline(object):
         state_batch = [d[0] for d in mini_batch]
         mcts_probs_batch = [d[1] for d in mini_batch]
         winner_batch = [d[2] for d in mini_batch]
+        # Replay buffers can contain mixed tuple shapes:
+        #   - 3-tuple: (state, mcts_prob, winner)                     no tactic
+        #   - 4-tuple: (state, mcts_prob, winner, tactic)             B1 self-play
+        #   - 5-tuple: (state, mcts_prob, winner, value_mask, tactic) pretraining
+        # Build per-row `tactic_batch`, `tactic_mask` (for tactic-aux loss and
+        # sample-weight gating) plus `value_mask` (so unknown-value rows don't
+        # train the value head against a placeholder 0). Self-play 3/4-tuples
+        # are real game outcomes, so their value_mask defaults to 1.
+        zero_label = np.zeros(
+            self.board_width * self.board_height, dtype=np.float32)
         tactic_batch = []
         tactic_mask = []
+        value_mask = []
+        any_value_mask = False
         for d in mini_batch:
-            if len(d) > 3:
+            if len(d) >= 5:
+                tactic_batch.append(d[4])
+                tactic_mask.append(1.0)
+                value_mask.append(float(d[3]))
+                any_value_mask = True
+            elif len(d) == 4:
                 tactic_batch.append(d[3])
                 tactic_mask.append(1.0)
+                value_mask.append(1.0)
             else:
-                tactic_batch.append(np.zeros(
-                    self.board_width * self.board_height, dtype=np.float32))
+                tactic_batch.append(zero_label)
                 tactic_mask.append(0.0)
+                value_mask.append(1.0)
+        # Preserve backward compat with the train_step value-loss path: only
+        # forward value_mask if at least one row is actually masked off; this
+        # keeps the dense-mean path active in the common all-self-play case.
+        value_mask_arg = value_mask if any_value_mask else None
 
         self.learn_rate = self.get_scheduled_lr()
 
@@ -1793,7 +1912,8 @@ class TrainPipeline(object):
                 state_batch, mcts_probs_batch, winner_batch,
                 warmup_lr * self.lr_multiplier,
                 tactic_batch=tactic_batch,
-                tactic_mask=tactic_mask)
+                tactic_mask=tactic_mask,
+                value_mask=value_mask_arg)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                 np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)), axis=1))
@@ -1883,10 +2003,9 @@ class TrainPipeline(object):
                              policy_value_batch_fn,
                              c_puct=self.c_puct,
                              n_playout=self.eval_n_playout,
-                              vl_k=self.vl_k,
-                              n_vl=self.n_vl,
-                              max_oversample=self.max_oversample,
-                              tactic_prior_weight=self.tactic_prior_weight)
+                             vl_k=self.vl_k,
+                             n_vl=self.n_vl,
+                             max_oversample=self.max_oversample)
         pure = MCTS_Pure(c_puct=5, n_playout=self.pure_mcts_playout_num)
         win_cnt = defaultdict(int)
         eval_start = time.time()
@@ -2060,8 +2179,6 @@ def parse_args():
                    help="Target ratio of forced win/block samples in tactical pretraining data.")
     p.add_argument("--block-value-target", type=float, default=0.3,
                    help="Value target for forced block tactical pretraining samples.")
-    p.add_argument("--tactic-prior-weight", type=float, default=0.0,
-                   help="Soft MCTS prior multiplier for tactical moves. Default 0 disables P2 so tactics do not bias MCTS search.")
     p.add_argument("--backbone", choices=("mlp", "mixer"), default="mlp",
                    help="Policy-value backbone. Default keeps the existing MLP; mixer is opt-in.")
     p.add_argument("--mixer-dim", type=int, default=128)
@@ -2117,7 +2234,6 @@ if __name__ == "__main__":
         tactic_pretrain_workers=args.tactic_pretrain_workers,
         tactic_loss_weight=args.tactic_loss_weight,
         pretrain_tactic_loss_weight=args.pretrain_tactic_loss_weight,
-        tactic_prior_weight=args.tactic_prior_weight,
         forced_ratio=args.forced_ratio,
         block_value_target=args.block_value_target,
         tactic_sample_weight=args.tactic_sample_weight,
