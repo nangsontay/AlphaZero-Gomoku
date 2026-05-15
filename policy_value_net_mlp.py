@@ -177,9 +177,8 @@ class PolicyValueNet:
 
     def __init__(self, board_width, board_height, model_file=None,
                  use_gpu=False, in_channels=4,
-                 # MLP-specific knobs (callers may ignore them):
-                 embed_dim=32, hidden_dim=1536, num_blocks=6,
-                 value_hidden=256, dropout=0.1, norm="ln", act="gelu",
+                 embed_dim=8, hidden_dim=384, num_blocks=4, 
+                 value_hidden=128, dropout=0.1, norm="ln", act="gelu",
                  use_amp=None, sym_loss_weight=0.0,
                  # v2 addition (§5): control random D4 in policy_value_fn.
                  search_d4_random=True,
