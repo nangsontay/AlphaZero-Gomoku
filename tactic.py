@@ -16,14 +16,16 @@ Gomoku tactics (from strategy.md):
   - Blocked Three / Half-Four           (0.20 / 0.15 block)
   - Open Two                            (0.10)
 
-Uses the pattern scoring engine from mcts_pure for direction scanning.
+Uses the pattern scoring engine from :mod:`tactic_patterns` for direction
+scanning.  This module is independent of :mod:`mcts_pure` so the pure
+MCTS opponent can be kept truly heuristic-free.
 """
 
 import numpy as np
 
-# Import the pattern-scoring primitives from mcts_pure.
-# mcts_pure does NOT import from tactic, so no circular dependency.
-from mcts_pure import (
+# Import the pattern-scoring primitives from tactic_patterns.
+# tactic_patterns does not import from tactic, so no circular dependency.
+from tactic_patterns import (
     _scan_direction, _line_score, _DIRECTIONS,
     _SCORE_WIN, _SCORE_OPEN_FOUR, _SCORE_HALF_FOUR,
     _SCORE_OPEN_THREE, _SCORE_BLOCKED_THREE, _SCORE_GAP_THREE,
@@ -95,7 +97,7 @@ def is_threat_move(board, move, player):
 
 
 # -----------------------------------------------------------------------
-# Enhanced pattern-based tactical evaluation (uses mcts_pure engine)
+# Enhanced pattern-based tactical evaluation (uses tactic_patterns engine)
 # -----------------------------------------------------------------------
 
 def _evaluate_move_tactical(board, move, player):
