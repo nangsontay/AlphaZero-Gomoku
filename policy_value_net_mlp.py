@@ -21,8 +21,12 @@ import torch.optim as optim
 import numpy as np
 from contextlib import nullcontext
 
-# v2 addition (§3.6): module-level architecture version.
-MLP_ARCH_VERSION = "1.0.0"
+# Sidecar architecture versions.  The default MLP backbone remains compatible
+# with the 1.x state_dict layout, while the opt-in Mixer backbone is a breaking
+# layout and must reject old checkpoints.
+MLP_ARCH_VERSION = "1.2.0-mlp"
+MLP_MIXER_ARCH_VERSION = "2.0.0-mixer"
+_COMPATIBLE_MLP_ARCH_VERSIONS = {"1.0.0", "1.1.0-tactic", MLP_ARCH_VERSION}
 
 
 def set_learning_rate(optimizer, lr):
@@ -82,16 +86,22 @@ class PerCellEmbed(nn.Module):
 
 
 class MLPResBlock(nn.Module):
-    """Pre-norm residual block: x + Linear(GELU(LN(Linear(GELU(LN(x))))))."""
+    """Bottleneck pre-norm residual block.
 
-    def __init__(self, dim, dropout=0.1, norm="ln", act="gelu"):
+    x + Linear(inner→dim, GELU(LN(Linear(dim→inner, GELU(LN(x))))))
+    With bottleneck_ratio=4: dim→dim//4→dim, reducing params ~4× per block.
+    """
+
+    def __init__(self, dim, dropout=0.1, norm="ln", act="gelu",
+                 bottleneck_ratio=4):
         super().__init__()
+        inner = max(64, dim // bottleneck_ratio)
         Norm = nn.LayerNorm if norm == "ln" else nn.BatchNorm1d
         Act = nn.GELU if act == "gelu" else nn.ReLU
         self.n1 = Norm(dim)
-        self.n2 = Norm(dim)
-        self.fc1 = nn.Linear(dim, dim)
-        self.fc2 = nn.Linear(dim, dim)
+        self.n2 = Norm(inner)
+        self.fc1 = nn.Linear(dim, inner)
+        self.fc2 = nn.Linear(inner, dim)
         self.act = Act()
         self.drop = nn.Dropout(dropout)
 
@@ -105,12 +115,14 @@ class MLPResBlock(nn.Module):
 class MLPNet(nn.Module):
     """Pure-MLP policy-value net for 15x15 Gomoku.
 
-    Approximate parameter count: ~40.1M (see Appendix C of the v2 plan).
+    Approximate parameter count: ~5.5M (bottleneck config, optimised for 15x15).
+    Uses bottleneck ResBlocks (dim→dim//4→dim) to cut per-block params ~4×.
     """
 
     def __init__(self, board_width, board_height, in_channels=4,
-                 embed_dim=8, hidden_dim=512, num_blocks=4,
-                 value_hidden=128, dropout=0.1, norm="ln", act="gelu"):
+                 embed_dim=16, hidden_dim=256, num_blocks=5,
+                 value_hidden=128, dropout=0.1, norm="ln", act="gelu",
+                 bottleneck_ratio=4):
         super().__init__()
         self.board_width = int(board_width)
         self.board_height = int(board_height)
@@ -122,6 +134,7 @@ class MLPNet(nn.Module):
         self.norm = str(norm)
         self.act = str(act)
         self.board_size = self.board_width * self.board_height
+        self.bottleneck_ratio = int(bottleneck_ratio)
 
         self.embed = PerCellEmbed(self.in_channels, self.embed_dim)
 
@@ -134,12 +147,14 @@ class MLPNet(nn.Module):
             Act(),
         )
         self.trunk = nn.Sequential(*[
-            MLPResBlock(self.hidden_dim, dropout, norm, act)
+            MLPResBlock(self.hidden_dim, dropout, norm, act,
+                        bottleneck_ratio=self.bottleneck_ratio)
             for _ in range(self.num_blocks)
         ])
         self.head_norm = Norm(self.hidden_dim)
 
         self.policy_head = nn.Linear(self.hidden_dim, self.board_size)
+        self.tactic_head = nn.Linear(self.hidden_dim, self.board_size)
 
         self.value_fc1 = nn.Linear(self.hidden_dim, self.value_hidden)
         self.value_act = Act()
@@ -161,15 +176,121 @@ class MLPNet(nn.Module):
                 f"MLPNet expected H={self.board_height}, W={self.board_width}; "
                 f"got H={x.size(2)}, W={x.size(3)}."
             )
-        x = self.embed(x)                                  # (N, 225*32)
-        x = self.stem(x)                                   # (N, 1536)
-        x = self.trunk(x)                                  # (N, 1536)
-        x = self.head_norm(x)                              # (N, 1536)
+        x = self.embed(x)                                  # (N, 225*embed)
+        x = self.stem(x)                                   # (N, hidden)
+        x = self.trunk(x)                                  # (N, hidden)
+        x = self.head_norm(x)                              # (N, hidden)
         # Cast logits to float32 BEFORE log_softmax so AMP/FP16 paths stay
         # numerically stable.
         log_p = F.log_softmax(self.policy_head(x).float(), dim=1)   # (N, 225)
+        tactic_logits = self.tactic_head(x).float()                 # (N, 225)
         v = torch.tanh(self.value_fc2(self.value_act(self.value_fc1(x))))
-        return log_p, v
+        return log_p, v, tactic_logits
+
+
+class MixerBlock(nn.Module):
+    """Pre-norm MLP-Mixer block with token and channel residual paths."""
+
+    def __init__(self, board_size, dim, token_hidden, ch_hidden, dropout=0.1):
+        super().__init__()
+        self.norm_tokens = nn.LayerNorm(dim)
+        self.token_mix = nn.Sequential(
+            nn.Linear(board_size, token_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(token_hidden, board_size),
+            nn.Dropout(dropout),
+        )
+        self.norm_channels = nn.LayerNorm(dim)
+        self.channel_mix = nn.Sequential(
+            nn.Linear(dim, ch_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ch_hidden, dim),
+            nn.Dropout(dropout),
+        )
+        self._init_mixer_weights()
+
+    def _init_mixer_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        y = self.norm_tokens(x).transpose(1, 2)
+        y = self.token_mix(y).transpose(1, 2)
+        x = x + y
+        y = self.channel_mix(self.norm_channels(x))
+        return x + y
+
+
+class MixerNet(nn.Module):
+    """Pure MLP-Mixer policy-value net preserving per-cell representations."""
+
+    def __init__(self, board_width, board_height, in_channels=4,
+                 mixer_dim=128, mixer_depth=6, mixer_token_hidden=256,
+                 mixer_ch_hidden=384, mixer_value_hidden=128,
+                 mixer_dropout=0.1):
+        super().__init__()
+        self.board_width = int(board_width)
+        self.board_height = int(board_height)
+        self.in_channels = int(in_channels)
+        self.board_size = self.board_width * self.board_height
+        self.mixer_dim = int(mixer_dim)
+        self.mixer_depth = int(mixer_depth)
+        self.mixer_token_hidden = int(mixer_token_hidden)
+        self.mixer_ch_hidden = int(mixer_ch_hidden)
+        self.mixer_value_hidden = int(mixer_value_hidden)
+        self.mixer_dropout = float(mixer_dropout)
+
+        self.embed = nn.Linear(self.in_channels, self.mixer_dim)
+        self.blocks = nn.Sequential(*[
+            MixerBlock(
+                self.board_size, self.mixer_dim,
+                self.mixer_token_hidden, self.mixer_ch_hidden,
+                dropout=self.mixer_dropout,
+            )
+            for _ in range(self.mixer_depth)
+        ])
+        self.head_norm = nn.LayerNorm(self.mixer_dim)
+        self.policy_head = nn.Linear(self.mixer_dim, 1)
+        self.tactic_head = nn.Linear(self.mixer_dim, 1)
+        self.value_fc1 = nn.Linear(self.mixer_dim, self.mixer_value_hidden)
+        self.value_act = nn.GELU()
+        self.value_fc2 = nn.Linear(self.mixer_value_hidden, 1)
+        self._init_embed_and_heads()
+
+    def _init_embed_and_heads(self):
+        for m in (self.embed, self.policy_head, self.tactic_head,
+                  self.value_fc1, self.value_fc2):
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        if x.dim() != 4 or x.size(1) != self.in_channels:
+            raise ValueError(
+                f"MixerNet expected (N, {self.in_channels}, H, W); "
+                f"got tuple({tuple(x.shape)})."
+            )
+        if x.size(2) != self.board_height or x.size(3) != self.board_width:
+            raise ValueError(
+                f"MixerNet expected H={self.board_height}, W={self.board_width}; "
+                f"got H={x.size(2)}, W={x.size(3)}."
+            )
+        n = x.size(0)
+        x = x.permute(0, 2, 3, 1).reshape(n, self.board_size, self.in_channels)
+        x = self.embed(x)
+        x = self.blocks(x)
+        x = self.head_norm(x)
+        policy_logits = self.policy_head(x).squeeze(-1).float()
+        log_p = F.log_softmax(policy_logits, dim=1)
+        tactic_logits = self.tactic_head(x).squeeze(-1).float()
+        pooled = x.mean(dim=1)
+        v = torch.tanh(self.value_fc2(self.value_act(self.value_fc1(pooled))))
+        return log_p, v, tactic_logits
 
 
 class PolicyValueNet:
@@ -177,11 +298,17 @@ class PolicyValueNet:
 
     def __init__(self, board_width, board_height, model_file=None,
                  use_gpu=False, in_channels=4,
-                 embed_dim=8, hidden_dim=384, num_blocks=4, 
+                 # MLP-specific knobs (callers may ignore them):
+                 embed_dim=24, hidden_dim=768, num_blocks=3,
                  value_hidden=128, dropout=0.1, norm="ln", act="gelu",
                  use_amp=None, sym_loss_weight=0.0,
+                 tactic_loss_weight=0.25, tactic_sample_weight=1.5,
                  # v2 addition (§5): control random D4 in policy_value_fn.
                  search_d4_random=True,
+                 backbone="mlp",
+                 mixer_dim=128, mixer_depth=6,
+                 mixer_token_hidden=256, mixer_ch_hidden=384,
+                 mixer_value_hidden=128, mixer_dropout=0.1,
                  # CNN knobs accepted-and-ignored for backward-compat:
                  num_blocks_cnn=None, channels=None):
         self.use_gpu = bool(use_gpu) and torch.cuda.is_available()
@@ -195,15 +322,54 @@ class PolicyValueNet:
         self.grad_clip_norm = 1.0
         self.use_amp = bool(self.use_gpu if use_amp is None else use_amp)
         self.sym_loss_weight = float(sym_loss_weight)
+        self.tactic_loss_weight = float(tactic_loss_weight)
+        self.tactic_sample_weight = max(0.0, float(tactic_sample_weight))
         self.search_d4_random = bool(search_d4_random)
+        self.backbone = str(backbone).lower()
+        if self.backbone not in ("mlp", "mixer"):
+            raise ValueError("backbone must be 'mlp' or 'mixer', got {!r}".format(backbone))
+        self.mlp_config = {
+            "embed_dim": int(embed_dim),
+            "hidden_dim": int(hidden_dim),
+            "num_blocks": int(num_blocks),
+            "value_hidden": int(value_hidden),
+            "dropout": float(dropout),
+            "norm": str(norm),
+            "act": str(act),
+        }
+        self.mixer_config = {
+            "dim": int(mixer_dim),
+            "depth": int(mixer_depth),
+            "token_hidden": int(mixer_token_hidden),
+            "ch_hidden": int(mixer_ch_hidden),
+            "value_hidden": int(mixer_value_hidden),
+            "dropout": float(mixer_dropout),
+        }
+        self.last_train_metrics = {}
 
-        self.policy_value_net = MLPNet(
-            self.board_width, self.board_height,
-            in_channels=self.in_channels,
-            embed_dim=embed_dim, hidden_dim=hidden_dim,
-            num_blocks=num_blocks, value_hidden=value_hidden,
-            dropout=dropout, norm=norm, act=act,
-        ).to(self.device)
+        if self.backbone == "mixer":
+            self.policy_value_net = MixerNet(
+                self.board_width, self.board_height,
+                in_channels=self.in_channels,
+                mixer_dim=self.mixer_config["dim"],
+                mixer_depth=self.mixer_config["depth"],
+                mixer_token_hidden=self.mixer_config["token_hidden"],
+                mixer_ch_hidden=self.mixer_config["ch_hidden"],
+                mixer_value_hidden=self.mixer_config["value_hidden"],
+                mixer_dropout=self.mixer_config["dropout"],
+            ).to(self.device)
+        else:
+            self.policy_value_net = MLPNet(
+                self.board_width, self.board_height,
+                in_channels=self.in_channels,
+                embed_dim=self.mlp_config["embed_dim"],
+                hidden_dim=self.mlp_config["hidden_dim"],
+                num_blocks=self.mlp_config["num_blocks"],
+                value_hidden=self.mlp_config["value_hidden"],
+                dropout=self.mlp_config["dropout"],
+                norm=self.mlp_config["norm"],
+                act=self.mlp_config["act"],
+            ).to(self.device)
 
         self.optimizer = optim.SGD(
             self.policy_value_net.parameters(),
@@ -229,7 +395,19 @@ class PolicyValueNet:
                                 if k != "state_dict"):
                 net_params = net_params["state_dict"]
             try:
-                self.policy_value_net.load_state_dict(net_params)
+                missing, unexpected = self.policy_value_net.load_state_dict(
+                    net_params, strict=False)
+                allowed_missing = set()
+                if self.backbone == "mlp":
+                    allowed_missing = {"tactic_head.weight", "tactic_head.bias"}
+                real_missing = [k for k in missing if k not in allowed_missing]
+                if real_missing or unexpected:
+                    raise RuntimeError(
+                        "missing keys: {}, unexpected keys: {}".format(
+                            real_missing, list(unexpected)))
+                if missing:
+                    print("[mlp] initialized new tactic head while loading legacy checkpoint: {}".format(
+                        ", ".join(missing)), flush=True)
             except RuntimeError as exc:
                 raise RuntimeError(
                     "Incompatible MLP checkpoint. The file at '{}' does not "
@@ -250,21 +428,24 @@ class PolicyValueNet:
         return model_file + ".json"
 
     def _build_sidecar(self):
-        return {
-            "MLP_ARCH_VERSION": MLP_ARCH_VERSION,
+        sidecar = {
+            "MLP_ARCH_VERSION": (MLP_MIXER_ARCH_VERSION
+                                 if self.backbone == "mixer"
+                                 else MLP_ARCH_VERSION),
             "board_width": self.board_width,
             "board_height": self.board_height,
             "in_channels": self.in_channels,
-            "embed_dim": self.policy_value_net.embed_dim,
-            "hidden_dim": self.policy_value_net.hidden_dim,
-            "num_blocks": self.policy_value_net.num_blocks,
-            "value_hidden": self.policy_value_net.value_hidden,
-            "norm": self.policy_value_net.norm,
-            "act": self.policy_value_net.act,
+            "backbone": self.backbone,
             "d4_randomisation": self.search_d4_random,
+            "tactic_sample_weight": self.tactic_sample_weight,
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "git_sha": os.environ.get("GIT_SHA", "unknown"),
         }
+        if self.backbone == "mixer":
+            sidecar["mixer"] = dict(self.mixer_config)
+        else:
+            sidecar.update(dict(self.mlp_config))
+        return sidecar
 
     def _maybe_check_sidecar(self, model_file):
         path = self._sidecar_path(model_file)
@@ -275,10 +456,18 @@ class PolicyValueNet:
         with open(path) as f:
             meta = json.load(f)
         ver = meta.get("MLP_ARCH_VERSION")
-        if ver != MLP_ARCH_VERSION:
+        if self.backbone == "mixer":
+            expected_versions = {MLP_MIXER_ARCH_VERSION}
+        else:
+            expected_versions = _COMPATIBLE_MLP_ARCH_VERSIONS
+        if ver not in expected_versions:
+            if self.backbone == "mlp" and ver == "1.0.0":
+                print(f"[mlp] WARNING: loading legacy MLP sidecar version '{ver}' "
+                      f"with newly initialized tactic head.", flush=True)
+                return
             raise RuntimeError(
                 f"MLP_ARCH_VERSION mismatch: checkpoint='{ver}' "
-                f"vs running='{MLP_ARCH_VERSION}'. Refusing to load."
+                f"vs running='{sorted(expected_versions)}'. Refusing to load."
             )
 
     def save_model(self, model_file):
@@ -313,7 +502,7 @@ class PolicyValueNet:
 
         with torch.no_grad():
             with self._autocast_context():
-                log_act_probs, value = self.policy_value_net(state_batch)
+                log_act_probs, value, _ = self.policy_value_net(state_batch)
 
         act_probs = torch.exp(log_act_probs).detach().cpu().numpy()
         value = value.detach().cpu().numpy()
@@ -341,7 +530,7 @@ class PolicyValueNet:
             # evaluator's call site does not need to change.
             state_tensor = state_tensor.to(memory_format=torch.channels_last)
         with torch.no_grad():
-            log_act_probs, value = self.policy_value_net(state_tensor)
+            log_act_probs, value, _ = self.policy_value_net(state_tensor)
         act_probs = torch.exp(log_act_probs.float()).detach().cpu().numpy()
         value = value.float().detach().cpu().numpy()
         return act_probs, value
@@ -366,7 +555,7 @@ class PolicyValueNet:
             state_tensor = torch.from_numpy(state).to(self.device)
             with torch.no_grad():
                 with self._autocast_context():
-                    _, v = self.policy_value_net(state_tensor)
+                    _, v, _ = self.policy_value_net(state_tensor)
             return iter([]), float(v.detach().cpu().numpy()[0][0])
 
         if self.search_d4_random:
@@ -379,7 +568,7 @@ class PolicyValueNet:
         state_tensor = torch.from_numpy(state).to(self.device)
         with torch.no_grad():
             with self._autocast_context():
-                log_p, v = self.policy_value_net(state_tensor)
+                log_p, v, _ = self.policy_value_net(state_tensor)
         act_probs = torch.exp(log_p).detach().cpu().numpy().flatten()
         value = float(v.detach().cpu().numpy()[0][0])
 
@@ -392,27 +581,66 @@ class PolicyValueNet:
         act_probs = zip(legal_positions, act_probs[legal_positions])
         return act_probs, value
 
-    def train_step(self, state_batch, mcts_probs, winner_batch, lr):
+    def train_step(self, state_batch, mcts_probs, winner_batch, lr,
+                   tactic_batch=None, tactic_mask=None):
         """perform a training step (v2 §3.4 with E04 finite-loss guard)."""
         self.policy_value_net.train()
         state_batch = self._to_tensor(state_batch)
         mcts_probs = self._to_tensor(mcts_probs)
         winner_batch = self._to_tensor(winner_batch)
+        tactic_targets = None
+        tactic_mask_tensor = None
+        if tactic_batch is not None:
+            tactic_targets = self._to_tensor(tactic_batch)
+            if tactic_mask is not None:
+                tactic_mask_tensor = self._to_tensor(tactic_mask).view(-1, 1)
 
         self.optimizer.zero_grad(set_to_none=True)
         set_learning_rate(self.optimizer, lr)
 
         with self._autocast_context():
-            log_p, v = self.policy_value_net(state_batch)
-            value_loss = F.mse_loss(v.view(-1), winner_batch)
-            policy_loss = -torch.mean(torch.sum(mcts_probs * log_p, dim=1))
+            log_p, v, tactic_logits = self.policy_value_net(state_batch)
+            sample_w = torch.ones(state_batch.size(0), device=self.device)
+            if tactic_targets is not None and self.tactic_sample_weight > 0.0:
+                tactic_for_weight = tactic_targets
+                if tactic_mask_tensor is not None:
+                    tactic_for_weight = torch.where(
+                        tactic_mask_tensor > 0.5,
+                        tactic_for_weight,
+                        torch.zeros_like(tactic_for_weight),
+                    )
+                tactic_max = tactic_for_weight.max(dim=1).values.clamp(0.0, 1.0)
+                sample_w = (1.0 + self.tactic_sample_weight * tactic_max).detach()
+                if tactic_mask_tensor is not None:
+                    mask_1d = tactic_mask_tensor.view(-1)
+                    sample_w = torch.where(
+                        mask_1d > 0.5, sample_w, torch.ones_like(sample_w))
+            value_loss = (sample_w * (v.view(-1) - winner_batch).pow(2)).mean()
+            policy_loss = -(sample_w * torch.sum(mcts_probs * log_p, dim=1)).mean()
             loss = value_loss + policy_loss
+            if tactic_targets is not None and self.tactic_loss_weight > 0.0:
+                tactic_loss_raw = F.binary_cross_entropy_with_logits(
+                    tactic_logits, tactic_targets, reduction='none')
+                if tactic_mask_tensor is not None:
+                    tactic_loss_raw = tactic_loss_raw * tactic_mask_tensor
+                    valid_elements = tactic_mask_tensor.sum() * tactic_loss_raw.size(1)
+                    tactic_loss = tactic_loss_raw.sum() / valid_elements.clamp_min(1.0)
+                else:
+                    tactic_loss = tactic_loss_raw.mean()
+                loss = loss + self.tactic_loss_weight * tactic_loss
 
             # Optional symmetry regularisation (see §6).
             if self.sym_loss_weight > 0.0:
                 loss = loss + self.sym_loss_weight * self._sym_loss(
                     state_batch, log_p
                 )
+
+        with torch.no_grad():
+            sample_w_f32 = sample_w.float()
+            self.last_train_metrics = {
+                "mean_sample_w": float(sample_w_f32.mean().detach().cpu().item()),
+                "frac_high_weight": float((sample_w_f32 >= 2.0).float().mean().detach().cpu().item()),
+            }
 
         # E04 guard: never let NaN/Inf reach .backward().
         if not torch.isfinite(loss):
@@ -440,6 +668,40 @@ class PolicyValueNet:
         )
         return loss.item(), entropy.item()
 
+    def tactic_train_step(self, state_batch, tactic_batch, lr):
+        """Train only the auxiliary tactic objective on generated tactic labels."""
+        self.policy_value_net.train()
+        state_batch = self._to_tensor(state_batch)
+        tactic_targets = self._to_tensor(tactic_batch)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        set_learning_rate(self.optimizer, lr)
+
+        with self._autocast_context():
+            _, _, tactic_logits = self.policy_value_net(state_batch)
+            loss = F.binary_cross_entropy_with_logits(
+                tactic_logits, tactic_targets)
+
+        if not torch.isfinite(loss):
+            self.optimizer.zero_grad(set_to_none=True)
+            return float("nan")
+
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(
+                self.policy_value_net.parameters(), self.grad_clip_norm
+            )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(
+                self.policy_value_net.parameters(), self.grad_clip_norm
+            )
+            self.optimizer.step()
+        return loss.item()
+
     def _sym_loss(self, state_batch, log_p_orig):
         """Symmetry regularisation. state_batch: (N, 4, 15, 15) on self.device.
 
@@ -463,7 +725,7 @@ class PolicyValueNet:
         if do_flip:
             s = torch.flip(s, dims=(3,))
 
-        log_p_d4, _ = self.policy_value_net(s)
+        log_p_d4, _, _ = self.policy_value_net(s)
 
         p_orig = torch.exp(log_p_orig).detach().view(
             -1, self.board_height, self.board_width

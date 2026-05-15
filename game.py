@@ -6,6 +6,8 @@
 from __future__ import print_function
 import numpy as np
 
+from tactic import get_tactic_label_vector
+
 
 class Board(object):
     """board for the game"""
@@ -184,8 +186,16 @@ class Game(object):
                     print('_'.center(8), end='')
             print('\r\n\r\n')
 
-    def start_play(self, player1, player2, start_player=0, is_shown=1):
-        """start a game between two players"""
+    def start_play(self, player1, player2, start_player=0, is_shown=1,
+                   move_log_prefix=None):
+        """start a game between two players
+
+        If move_log_prefix is a non-empty string, print a per-move progress line
+        (with elapsed time per move and cumulative time) prefixed with it. This
+        is useful for showing that long-running evaluation games are making
+        progress and not deadlocked.
+        """
+        import time as _time
         if start_player not in (0, 1):
             raise Exception('start_player should be either 0 (player1 first) '
                             'or 1 (player2 first)')
@@ -194,13 +204,38 @@ class Game(object):
         player1.set_player_ind(p1)
         player2.set_player_ind(p2)
         players = {p1: player1, p2: player2}
+        # Drop any stale MCTS tree carried over from a previous game.
+        for _pl in (player1, player2):
+            if hasattr(_pl, 'reset_player'):
+                _pl.reset_player()
         if is_shown:
             self.graphic(self.board, player1.player, player2.player)
+        log_moves = bool(move_log_prefix)
+        game_start_t = _time.time() if log_moves else 0.0
+        move_idx = 0
         while True:
             current_player = self.board.get_current_player()
             player_in_turn = players[current_player]
+            move_start_t = _time.time() if log_moves else 0.0
             move = player_in_turn.get_action(self.board)
             self.board.do_move(move)
+            # Keep the opponent's MCTS tree in sync with the actual move.
+            other_player = players[p2 if current_player == p1 else p1]
+            if hasattr(other_player, 'notify_opponent_move'):
+                other_player.notify_opponent_move(move)
+            if log_moves:
+                move_idx += 1
+                move_elapsed = _time.time() - move_start_t
+                total_elapsed = _time.time() - game_start_t
+                player_name = type(player_in_turn).__module__ + "." + \
+                    type(player_in_turn).__name__
+                print(
+                    "{} move {:>3} by {} (player {}): action={}, "
+                    "move_elapsed={:.1f}s, total_elapsed={:.1f}s".format(
+                        move_log_prefix, move_idx, player_name,
+                        current_player, move, move_elapsed, total_elapsed),
+                    flush=True,
+                )
             if is_shown:
                 self.graphic(self.board, player1.player, player2.player)
             end, winner = self.board.game_end()
@@ -214,9 +249,11 @@ class Game(object):
 
     def start_self_play(self, player, is_shown=0, temp=1e-3,
                         temperature_moves=None, temp_high=1.0,
-                        temp_low=1e-3):
+                        temp_low=1e-3, return_tactic_labels=False):
         """ start a self-play game using a MCTS player, reuse the search tree,
-        and store the self-play data: (state, mcts_probs, z) for training
+        and store the self-play data: (state, mcts_probs, z) for training.
+        If return_tactic_labels is true, return
+        (state, mcts_probs, z, tactic_label) samples.
 
         temp remains as the backward-compatible fixed-temperature path when
         temperature_moves is None. Pass temperature_moves=0 to use temp_low
@@ -225,7 +262,7 @@ class Game(object):
         """
         self.board.init_board()
         p1, p2 = self.board.players
-        states, mcts_probs, current_players = [], [], []
+        states, mcts_probs, current_players, tactic_labels = [], [], [], []
         move_idx = 0
         while True:
             cur_temp = temp
@@ -238,6 +275,8 @@ class Game(object):
             states.append(self.board.current_state().copy())
             mcts_probs.append(move_probs)
             current_players.append(self.board.current_player)
+            if return_tactic_labels:
+                tactic_labels.append(get_tactic_label_vector(self.board))
             # perform a move
             self.board.do_move(move)
             move_idx += 1
@@ -257,4 +296,7 @@ class Game(object):
                         print("Game end. Winner is player:", winner)
                     else:
                         print("Game end. Tie")
+                if return_tactic_labels:
+                    return winner, zip(states, mcts_probs, winners_z,
+                                       tactic_labels)
                 return winner, zip(states, mcts_probs, winners_z)

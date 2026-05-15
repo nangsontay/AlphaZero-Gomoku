@@ -53,7 +53,7 @@ class GomokuGUI:
         self.ai_player = None
         
         # Biến lưu trữ đối thủ và lượt đánh
-        self.ai_level = tk.StringVar(value="Level 9 (400 Playouts)")
+        self.ai_level = tk.StringVar(value="Level 9 (1000 Playouts)")
         self.opponent_type = tk.StringVar(value="Human")
         self.first_player = tk.StringVar(value="AI (Black)")
         self.last_move_marker = None
@@ -68,7 +68,7 @@ class GomokuGUI:
         control_frame.pack(pady=10)
 
         tk.Label(control_frame, text="AI Level:", font=("Arial", 12)).grid(row=0, column=0, padx=5)
-        level_menu = ttk.Combobox(control_frame, textvariable=self.ai_level, values=["Level 9 (400 Playouts)", "Level 10 (1500 Playouts)"], state="readonly", width=22)
+        level_menu = ttk.Combobox(control_frame, textvariable=self.ai_level, values=["Level 9 (1000 Playouts)", "Level 10 (10000 Playouts)"], state="readonly", width=22)
         level_menu.grid(row=0, column=1, columnspan=2, padx=5, pady=5)
 
         tk.Label(control_frame, text="Opponent:", font=("Arial", 12)).grid(row=1, column=0, padx=5)
@@ -124,10 +124,10 @@ class GomokuGUI:
         self.draw_board()
 
         # Khởi tạo AI dựa trên Level
-        if self.ai_level.get() == "Level 9 (400 Playouts)":
-            self.ai_player = MCTSPlayer(self.policy_value_fn, c_puct=5, n_playout=400)
+        if self.ai_level.get() == "Level 9 (1000 Playouts)":
+            self.ai_player = MCTSPlayer(self.policy_value_fn, c_puct=5, n_playout=1000)
         else:
-            self.ai_player = MCTSPlayer(self.policy_value_fn, c_puct=5, n_playout=1500)
+            self.ai_player = MCTSPlayer(self.policy_value_fn, c_puct=5, n_playout=10000)
 
         # Khởi tạo đối thủ dựa trên lựa chọn UI
         if self.opponent_type.get() == "Human":
@@ -135,7 +135,7 @@ class GomokuGUI:
         elif self.opponent_type.get() == "Random":
             self.opponent = RandomPlayer()
         else:
-            self.opponent = MCTS_Pure(c_puct=5, n_playout=1000)
+            self.opponent = MCTS_Pure(c_puct=5, n_playout=2000)
 
         # Xác định ai đi trước (Black luôn đi trước trong Gomoku)
         self.board.init_board(0) # 0 nghĩa là p1 luôn đi trước
@@ -189,6 +189,14 @@ class GomokuGUI:
         # Lấy nước đi
         move = player_in_turn.get_action(self.board)
         self.board.do_move(move)
+
+        # Notify the OTHER player about this move so it can reuse its tree.
+        other_player = (
+            self.opponent if player_in_turn == self.ai_player
+            else self.ai_player
+        )
+        if hasattr(other_player, 'notify_opponent_move'):
+            other_player.notify_opponent_move(move)
         
         # Cập nhật UI
         self.draw_piece(move, current_player)
@@ -215,6 +223,11 @@ class GomokuGUI:
                 if move in self.board.availables:
                     self.board.do_move(move)
                     self.draw_piece(move, current_player)
+
+                    # Notify other players about the human move for tree reuse.
+                    for p in self.players.values():
+                        if p is not player_in_turn and hasattr(p, 'notify_opponent_move'):
+                            p.notify_opponent_move(move)
                     
                     if not self.check_game_end():
                         # Chuyển lượt cho AI/máy

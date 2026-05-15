@@ -9,6 +9,7 @@ all workers and calls PolicyValueNet.policy_value(batch).
 from __future__ import print_function
 
 import argparse
+import concurrent.futures
 import json
 import multiprocessing as mp
 import os
@@ -19,6 +20,14 @@ import time
 import traceback
 from collections import defaultdict, deque
 from multiprocessing import resource_tracker, shared_memory
+import numpy as np
+import torch
+
+from game import Board, Game
+from mcts_pure import MCTSPlayer as MCTS_Pure
+from mcts_alphaZero import MCTSPlayer
+from policy_value_net_mlp import PolicyValueNet
+from tactic import get_tactic_forced_move, get_tactic_label_vector
 
 
 class _ShuttingDown(Exception):
@@ -83,13 +92,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-import numpy as np
-import torch
 
-from game import Board, Game
-from mcts_pure import MCTSPlayer as MCTS_Pure
-from mcts_alphaZero import MCTSPlayer
-from policy_value_net_mlp import PolicyValueNet
 
 
 def set_cpu_threads(n=1):
@@ -106,25 +109,251 @@ def set_cpu_threads(n=1):
 
 def get_equi_data(play_data, board_width, board_height):
     extend_data = []
-    for state, mcts_prob, winner in play_data:
+    for sample in play_data:
+        state, mcts_prob, winner = sample[:3]
+        tactic_label = sample[3] if len(sample) > 3 else None
         for i in range(4):
             equi_state = np.array([np.rot90(s, i) for s in state])
             equi_mcts_prob = np.rot90(
                 mcts_prob.reshape(board_height, board_width), i
             )
-            extend_data.append((
-                equi_state,
-                equi_mcts_prob.flatten(),
-                winner,
-            ))
+            if tactic_label is None:
+                extend_data.append((
+                    equi_state,
+                    equi_mcts_prob.flatten(),
+                    winner,
+                ))
+            else:
+                equi_tactic = np.rot90(
+                    tactic_label.reshape(board_height, board_width), i
+                )
+                extend_data.append((
+                    equi_state,
+                    equi_mcts_prob.flatten(),
+                    winner,
+                    equi_tactic.flatten(),
+                ))
             equi_state_flip = np.array([np.fliplr(s) for s in equi_state])
             equi_mcts_prob_flip = np.fliplr(equi_mcts_prob)
-            extend_data.append((
-                equi_state_flip,
-                equi_mcts_prob_flip.flatten(),
-                winner,
-            ))
+            if tactic_label is None:
+                extend_data.append((
+                    equi_state_flip,
+                    equi_mcts_prob_flip.flatten(),
+                    winner,
+                ))
+            else:
+                equi_tactic_flip = np.fliplr(equi_tactic)
+                extend_data.append((
+                    equi_state_flip,
+                    equi_mcts_prob_flip.flatten(),
+                    winner,
+                    equi_tactic_flip.flatten(),
+                ))
     return extend_data
+
+
+def _generate_tactical_samples_raw(board_width=15, board_height=15, n_in_row=5,
+                                   num_samples=2048, max_random_moves=36,
+                                   seed=None, forced_ratio=0.6,
+                                   block_value_target=0.3,
+                                   softmax_temperature=1.0):
+    """Generate un-augmented tactical 4-tuples (state, policy, value, tactic).
+
+    This is the picklable, CPU-only core used by both the single-process path
+    and the process-pool workers. It must not import or touch CUDA/torch.
+    """
+    rng = random.Random(seed)
+    samples = []
+    forced_count = 0
+    non_forced_count = 0
+    attempts = 0
+    num_samples = int(num_samples)
+    max_attempts = max(num_samples * 20, 100)
+    board_size = int(board_width) * int(board_height)
+    forced_ratio = min(1.0, max(0.0, float(forced_ratio)))
+    target_forced = int(round(num_samples * forced_ratio))
+    target_non_forced = num_samples - target_forced
+    softmax_temperature = max(1e-6, float(softmax_temperature))
+    while len(samples) < num_samples and attempts < max_attempts:
+        attempts += 1
+        board = Board(width=board_width, height=board_height, n_in_row=n_in_row)
+        board.init_board(start_player=rng.randrange(2))
+        move_count = rng.randint(max(0, n_in_row - 2), max(0, int(max_random_moves)))
+        for _ in range(move_count):
+            if not board.availables:
+                break
+            move = rng.choice(board.availables)
+            board.do_move(move)
+            end, _ = board.game_end()
+            if end:
+                break
+        end, _ = board.game_end()
+        if end or not board.availables:
+            continue
+        tactic_label = get_tactic_label_vector(board)
+        if float(tactic_label.max()) <= 0.0:
+            continue
+        state = board.current_state().copy().astype(np.float32)
+        forced_move, is_win = get_tactic_forced_move(board)
+        policy_target = np.zeros(board_size, dtype=np.float32)
+        if forced_move is not None:
+            if target_forced > 0 and forced_count >= target_forced and non_forced_count < target_non_forced:
+                continue
+            policy_target[int(forced_move)] = 1.0
+            value_target = 1.0 if bool(is_win) else float(block_value_target)
+            forced_count += 1
+        else:
+            if target_non_forced > 0 and non_forced_count >= target_non_forced and forced_count < target_forced:
+                continue
+            legal = np.zeros(board_size, dtype=np.float32)
+            legal[np.asarray(board.availables, dtype=np.int64)] = 1.0
+            legal_scores = tactic_label.astype(np.float32) * legal
+            max_score = float(legal_scores.max())
+            if max_score <= 0.0:
+                continue
+            logits = legal_scores / softmax_temperature
+            logits[legal <= 0.0] = -np.inf
+            logits = logits - np.nanmax(logits)
+            probs = np.exp(logits).astype(np.float32)
+            probs[legal <= 0.0] = 0.0
+            denom = float(probs.sum())
+            if denom <= 0.0 or not np.isfinite(denom):
+                continue
+            policy_target = probs / denom
+            value_target = 0.0
+            non_forced_count += 1
+        samples.append((state, policy_target, value_target, tactic_label))
+    return samples, forced_count, non_forced_count, attempts
+
+
+def _tactical_samples_worker(arg_tuple):
+    """Top-level picklable worker entry point for the process pool.
+
+    Must remain importable under spawn semantics — accepts a single tuple so it
+    can be dispatched via ProcessPoolExecutor.map(). Returns the same shape as
+    _generate_tactical_samples_raw().
+    """
+    (board_width, board_height, n_in_row, num_samples, max_random_moves,
+     seed, forced_ratio, block_value_target, softmax_temperature) = arg_tuple
+    # Pin BLAS/OMP to 1 thread per worker so CPU oversubscription doesn't
+    # destroy wall-clock when the parent uses many workers.
+    try:
+        set_cpu_threads(1)
+    except Exception:
+        pass
+    return _generate_tactical_samples_raw(
+        board_width=board_width,
+        board_height=board_height,
+        n_in_row=n_in_row,
+        num_samples=num_samples,
+        max_random_moves=max_random_moves,
+        seed=seed,
+        forced_ratio=forced_ratio,
+        block_value_target=block_value_target,
+        softmax_temperature=softmax_temperature,
+    )
+
+
+def generate_tactical_samples(board_width=15, board_height=15, n_in_row=5,
+                              num_samples=2048, max_random_moves=36,
+                              seed=None, forced_ratio=0.6,
+                              block_value_target=0.3,
+                              softmax_temperature=1.0,
+                              workers=1):
+    """Generate tactical states with policy, value, and tactic targets.
+
+    When ``workers <= 1`` (default) the existing single-process generator is
+    used. When ``workers >= 2`` a spawn-based ``ProcessPoolExecutor`` splits
+    ``num_samples`` across worker processes; each worker only produces
+    CPU/numpy data and the parent merges results and applies D4 augmentation.
+    """
+    num_samples = int(num_samples)
+    workers = max(1, int(workers or 1))
+
+    if num_samples <= 0:
+        return []
+
+    if workers <= 1:
+        t0 = time.time()
+        raw, forced, non_forced, attempts = _generate_tactical_samples_raw(
+            board_width=board_width,
+            board_height=board_height,
+            n_in_row=n_in_row,
+            num_samples=num_samples,
+            max_random_moves=max_random_moves,
+            seed=seed,
+            forced_ratio=forced_ratio,
+            block_value_target=block_value_target,
+            softmax_temperature=softmax_temperature,
+        )
+        augmented = get_equi_data(raw, board_width, board_height)
+        print(
+            "tactical sample gen: mode=single, workers=1, raw={} (forced={}, non_forced={}, attempts={}), augmented={}, elapsed={:.2f}s".format(
+                len(raw), forced, non_forced, attempts, len(augmented),
+                time.time() - t0,
+            ),
+            flush=True,
+        )
+        return augmented
+
+    # Multi-process path. Split samples across workers as evenly as possible.
+    effective_workers = min(workers, num_samples)
+    base = num_samples // effective_workers
+    remainder = num_samples % effective_workers
+    chunks = []
+    base_seed = (int(seed) if seed is not None else int(time.time())) & 0x7FFFFFFF
+    for wid in range(effective_workers):
+        chunk_n = base + (1 if wid < remainder else 0)
+        if chunk_n <= 0:
+            continue
+        # Deterministic-but-distinct per-worker seed.
+        worker_seed = (base_seed + wid * 2654435761) & 0x7FFFFFFF
+        chunks.append((
+            int(board_width),
+            int(board_height),
+            int(n_in_row),
+            int(chunk_n),
+            int(max_random_moves),
+            int(worker_seed),
+            float(forced_ratio),
+            float(block_value_target),
+            float(softmax_temperature),
+        ))
+
+    t0 = time.time()
+    ctx = mp.get_context("spawn")
+    raw_total = []
+    total_forced = 0
+    total_non_forced = 0
+    total_attempts = 0
+    per_worker_summary = []
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=effective_workers, mp_context=ctx
+    ) as executor:
+        for wid, result in enumerate(
+            executor.map(_tactical_samples_worker, chunks)
+        ):
+            raw, forced, non_forced, attempts = result
+            raw_total.extend(raw)
+            total_forced += forced
+            total_non_forced += non_forced
+            total_attempts += attempts
+            per_worker_summary.append(
+                "w{}={}(f{}/n{}/a{})".format(
+                    wid, len(raw), forced, non_forced, attempts
+                )
+            )
+
+    augmented = get_equi_data(raw_total, board_width, board_height)
+    print(
+        "tactical sample gen: mode=pool, workers={}, raw={} (forced={}, non_forced={}, attempts={}), augmented={}, elapsed={:.2f}s, per_worker=[{}]".format(
+            effective_workers, len(raw_total), total_forced, total_non_forced,
+            total_attempts, len(augmented), time.time() - t0,
+            ", ".join(per_worker_summary),
+        ),
+        flush=True,
+    )
+    return augmented
 
 
 class RemotePolicyValueClient(object):
@@ -439,7 +668,7 @@ class CudaGraphInferenceWrapper(object):
         self.graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(self.graph):
-                self.static_log_p, self.static_v = self.model(self.static_in)
+                self.static_log_p, self.static_v, _ = self.model(self.static_in)
 
     def run(self, batch_np):
         batch_np = np.ascontiguousarray(batch_np, dtype=np.float32)
@@ -473,7 +702,10 @@ def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
                        log_every_batches=200, weight_event=None,
                        shutdown_event=None, shm_in_name=None, shm_out_name=None,
                        shm_slots=0, in_channels=4, use_cuda_graphs=True,
-                       inference_fp16=True):
+                       inference_fp16=True, backbone="mlp",
+                       mixer_dim=128, mixer_depth=6,
+                       mixer_token_hidden=256, mixer_ch_hidden=384,
+                       mixer_value_hidden=128, mixer_dropout=0.1):
     _ignore_sigint_in_child()
     set_cpu_threads(threads)
     total_requests = 0
@@ -490,7 +722,15 @@ def gpu_evaluator_loop(model_file, board_width, board_height, request_queue,
             model_file, use_gpu), flush=True)
         net = PolicyValueNet(board_width, board_height,
                              model_file=model_file, use_gpu=use_gpu,
-                             use_amp=False)
+                             in_channels=in_channels,
+                             use_amp=False,
+                             backbone=backbone,
+                             mixer_dim=mixer_dim,
+                             mixer_depth=mixer_depth,
+                             mixer_token_hidden=mixer_token_hidden,
+                             mixer_ch_hidden=mixer_ch_hidden,
+                             mixer_value_hidden=mixer_value_hidden,
+                             mixer_dropout=mixer_dropout)
         evaluator_use_gpu = bool(use_gpu and torch.cuda.is_available())
         evaluator_fp16 = bool(evaluator_use_gpu and inference_fp16)
         cuda_graph = None
@@ -759,7 +999,9 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                                  noise_eps=noise_eps,
                                  vl_k=vl_k,
                                  n_vl=n_vl,
-                                 max_oversample=max_oversample)
+                                  max_oversample=max_oversample,
+                                  tactic_prior_weight=float(args.get(
+                                      "tactic_prior_weight", 0.0)))
 
         episode_lens = []
         all_data = []
@@ -776,7 +1018,8 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
                 temp=temp,
                 temperature_moves=temperature_moves,
                 temp_high=temp_high,
-                temp_low=temp_low)
+                temp_low=temp_low,
+                return_tactic_labels=True)
             play_data = list(play_data)
             augmented = get_equi_data(play_data, bw, bh)
             episode_lens.append(len(play_data))
@@ -852,14 +1095,32 @@ class TrainPipeline(object):
                  games_per_worker=1, threads_per_worker=1, n_playout=800,
                  batch_size=512, game_batch_num=1500, check_freq=50,
                  eval_games=10, eval_batch_size=256, eval_timeout_ms=8,
-                 response_timeout=180.0, c_puct=3.0, eval_n_playout=1600,
+                 response_timeout=180.0, c_puct=3.0, eval_n_playout=400,
                  dirichlet_alpha=0.05, noise_eps=0.25,
                  vl_k=4, n_vl=1.0, max_oversample=3,
                  temperature_moves=8, temp_high=1.0, temp_low=1e-3,
-                 buffer_size=500000, recent_sample_window=200000,
-                 worker_model_file="./_tmp_gpu_evaluator_policy.model",
-                 batch_log_file="training_batches.log",
-                 use_cuda_graphs=True, inference_fp16=True):
+                  buffer_size=500000, recent_sample_window=200000,
+                  worker_model_file="./_tmp_gpu_evaluator_policy.model",
+                  batch_log_file="training_batches.log",
+                  use_cuda_graphs=True, inference_fp16=True,
+                  tactic_pretrain_steps=100,
+                  tactic_pretrain_samples=2048,
+                  tactic_pretrain_batch_size=256,
+                  tactic_pretrain_lr=5e-4,
+                  tactic_pretrain_workers=1,
+                  tactic_loss_weight=0.25,
+                  pretrain_tactic_loss_weight=0.5,
+                  tactic_prior_weight=0.0,
+                  forced_ratio=0.6,
+                  block_value_target=0.3,
+                  tactic_sample_weight=1.5,
+                  backbone="mlp",
+                  mixer_dim=128,
+                  mixer_depth=6,
+                  mixer_token_hidden=256,
+                  mixer_ch_hidden=384,
+                  mixer_value_hidden=128,
+                  mixer_dropout=0.1):
         self.use_gpu = bool(use_gpu)
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
@@ -877,6 +1138,24 @@ class TrainPipeline(object):
         self.batch_log_file = batch_log_file
         self.use_cuda_graphs = bool(use_cuda_graphs)
         self.inference_fp16 = bool(inference_fp16)
+        self.tactic_pretrain_steps = max(0, int(tactic_pretrain_steps))
+        self.tactic_pretrain_samples = max(0, int(tactic_pretrain_samples))
+        self.tactic_pretrain_batch_size = max(1, int(tactic_pretrain_batch_size))
+        self.tactic_pretrain_lr = float(tactic_pretrain_lr)
+        self.tactic_pretrain_workers = max(1, int(tactic_pretrain_workers))
+        self.tactic_loss_weight = max(0.0, float(tactic_loss_weight))
+        self.pretrain_tactic_loss_weight = max(0.0, float(pretrain_tactic_loss_weight))
+        self.tactic_prior_weight = max(0.0, float(tactic_prior_weight))
+        self.forced_ratio = min(1.0, max(0.0, float(forced_ratio)))
+        self.block_value_target = float(block_value_target)
+        self.tactic_sample_weight = max(0.0, float(tactic_sample_weight))
+        self.backbone = str(backbone).lower()
+        self.mixer_dim = int(mixer_dim)
+        self.mixer_depth = int(mixer_depth)
+        self.mixer_token_hidden = int(mixer_token_hidden)
+        self.mixer_ch_hidden = int(mixer_ch_hidden)
+        self.mixer_value_hidden = int(mixer_value_hidden)
+        self.mixer_dropout = float(mixer_dropout)
         self.last_update_metrics = None
         self.ctx = None
         self.request_queue = None
@@ -901,7 +1180,7 @@ class TrainPipeline(object):
         self.board = Board(width=self.board_width, height=self.board_height,
                            n_in_row=self.n_in_row)
         self.game = Game(self.board)
-        self.learn_rate = 5e-4
+        self.learn_rate = 1e-3
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.n_playout = int(n_playout)
@@ -920,25 +1199,82 @@ class TrainPipeline(object):
         self.batch_size = int(batch_size)
         self.check_freq = max(1, int(check_freq))
         self.data_buffer = deque(maxlen=self.buffer_size)
-        self.epochs = 5
+        self.epochs = 2
         self.kl_targ = 0.03
         self.global_update_count = 0
         self.weight_push_every = 4
         self.lr_schedule = [
-            (1500, 5e-4),
-            (8000, 2e-4),
-            (30000, 5e-5),
-            (float("inf"), 1e-5),
+            (1500, 1e-3),
+            (8000, 4e-4),
+            (30000, 1e-4),
+            (float("inf"), 2e-5),
         ]
         self.game_batch_num = int(game_batch_num)
         self.eval_games = int(eval_games)
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 2000
+        self.pure_mcts_playout_num = 400
 
         self.policy_value_net = PolicyValueNet(
             self.board_width, self.board_height,
             model_file=init_model, use_gpu=self.use_gpu,
-            sym_loss_weight=0.0)
+            sym_loss_weight=0.0,
+            tactic_loss_weight=self.tactic_loss_weight,
+            tactic_sample_weight=self.tactic_sample_weight,
+            backbone=self.backbone,
+            mixer_dim=self.mixer_dim,
+            mixer_depth=self.mixer_depth,
+            mixer_token_hidden=self.mixer_token_hidden,
+            mixer_ch_hidden=self.mixer_ch_hidden,
+            mixer_value_hidden=self.mixer_value_hidden,
+            mixer_dropout=self.mixer_dropout)
+
+    def tactical_pretrain(self):
+        """Run optional supervised pretraining for the auxiliary tactic head."""
+        if self.tactic_pretrain_steps <= 0 or self.tactic_pretrain_samples <= 0:
+            print("tactical pretraining disabled", flush=True)
+            return
+        gen_mode = "pool" if self.tactic_pretrain_workers > 1 else "single"
+        print("tactical pretraining: samples={}, steps={}, batch_size={}, lr={:.6g}, forced_ratio={:.2f}, block_value={:.3f}, gen_mode={}, gen_workers={}".format(
+            self.tactic_pretrain_samples, self.tactic_pretrain_steps,
+            self.tactic_pretrain_batch_size, self.tactic_pretrain_lr,
+            self.forced_ratio, self.block_value_target,
+            gen_mode, self.tactic_pretrain_workers), flush=True)
+        data = generate_tactical_samples(
+            self.board_width, self.board_height, self.n_in_row,
+            num_samples=self.tactic_pretrain_samples,
+            max_random_moves=60,
+            forced_ratio=self.forced_ratio,
+            block_value_target=self.block_value_target,
+            seed=int(time.time()) % (2 ** 31 - 1),
+            workers=self.tactic_pretrain_workers)
+        if not data:
+            print("tactical pretraining skipped: no tactical samples generated", flush=True)
+            return
+        losses = []
+        old_tactic_loss_weight = self.policy_value_net.tactic_loss_weight
+        self.policy_value_net.tactic_loss_weight = self.pretrain_tactic_loss_weight
+        try:
+            for step in range(self.tactic_pretrain_steps):
+                batch_size = min(self.tactic_pretrain_batch_size, len(data))
+                mini_batch = random.sample(data, batch_size)
+                state_batch = [d[0] for d in mini_batch]
+                policy_batch = [d[1] for d in mini_batch]
+                value_batch = [d[2] for d in mini_batch]
+                tactic_batch = [d[3] for d in mini_batch]
+                tactic_mask = [1.0 for _ in mini_batch]
+                loss, entropy = self.policy_value_net.train_step(
+                    state_batch, policy_batch, value_batch,
+                    self.tactic_pretrain_lr,
+                    tactic_batch=tactic_batch,
+                    tactic_mask=tactic_mask)
+                losses.append(float(loss))
+                if (step + 1) % max(1, self.tactic_pretrain_steps // 5) == 0:
+                    print("tactical pretrain step {}/{}: loss={:.6f}, entropy={:.6f}".format(
+                        step + 1, self.tactic_pretrain_steps, float(loss), float(entropy)), flush=True)
+        finally:
+            self.policy_value_net.tactic_loss_weight = old_tactic_loss_weight
+        print("tactical pretraining done: generated_positions={}, mean_loss={:.6f}".format(
+            len(data), float(np.nanmean(losses)) if losses else 0.0), flush=True)
 
     def save_cpu_model_for_evaluator(self):
         sd = self.policy_value_net.get_policy_param()
@@ -949,7 +1285,7 @@ class TrainPipeline(object):
 
     def setup_shared_memory(self):
         board_size = self.board_width * self.board_height
-        in_channels = 4
+        in_channels = self.policy_value_net.in_channels
         self.shm_slots = max(1024, self.num_workers * self.vl_k * 4)
         self.shm_in_shape = (self.shm_slots, in_channels,
                              self.board_width, self.board_height)
@@ -1020,9 +1356,16 @@ class TrainPipeline(object):
                 self.shm_in.name,
                 self.shm_out.name,
                 self.shm_slots,
-                4,
+                self.policy_value_net.in_channels,
                 self.use_cuda_graphs,
                 self.inference_fp16,
+                self.backbone,
+                self.mixer_dim,
+                self.mixer_depth,
+                self.mixer_token_hidden,
+                self.mixer_ch_hidden,
+                self.mixer_value_hidden,
+                self.mixer_dropout,
             ),
             name="gpu-evaluator")
         self.evaluator_proc.start()
@@ -1204,6 +1547,7 @@ class TrainPipeline(object):
                 "vl_k": self.vl_k,
                 "n_vl": self.n_vl,
                 "max_oversample": self.max_oversample,
+                "tactic_prior_weight": self.tactic_prior_weight,
                 "temperature_moves": self.temperature_moves,
                 "temp_high": self.temp_high,
                 "temp_low": self.temp_low,
@@ -1241,9 +1585,16 @@ class TrainPipeline(object):
                 None,
                 None,
                 0,
-                4,
+                self.policy_value_net.in_channels,
                 self.use_cuda_graphs,
                 self.inference_fp16,
+                self.backbone,
+                self.mixer_dim,
+                self.mixer_depth,
+                self.mixer_token_hidden,
+                self.mixer_ch_hidden,
+                self.mixer_value_hidden,
+                self.mixer_dropout,
             ),
             name="gpu-evaluator")
 
@@ -1408,6 +1759,16 @@ class TrainPipeline(object):
         state_batch = [d[0] for d in mini_batch]
         mcts_probs_batch = [d[1] for d in mini_batch]
         winner_batch = [d[2] for d in mini_batch]
+        tactic_batch = []
+        tactic_mask = []
+        for d in mini_batch:
+            if len(d) > 3:
+                tactic_batch.append(d[3])
+                tactic_mask.append(1.0)
+            else:
+                tactic_batch.append(np.zeros(
+                    self.board_width * self.board_height, dtype=np.float32))
+                tactic_mask.append(0.0)
 
         self.learn_rate = self.get_scheduled_lr()
 
@@ -1430,7 +1791,9 @@ class TrainPipeline(object):
         for _ in range(self.epochs):
             loss, entropy = self.policy_value_net.train_step(
                 state_batch, mcts_probs_batch, winner_batch,
-                warmup_lr * self.lr_multiplier)
+                warmup_lr * self.lr_multiplier,
+                tactic_batch=tactic_batch,
+                tactic_mask=tactic_mask)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (
                 np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)), axis=1))
@@ -1485,6 +1848,11 @@ class TrainPipeline(object):
             "v_new_mean": float(new_v_flat.mean()),
             "v_new_std": float(new_v_flat.std()),
         }
+        train_metrics = getattr(self.policy_value_net, "last_train_metrics", {}) or {}
+        self.last_update_metrics.update({
+            "mean_sample_w": float(train_metrics.get("mean_sample_w", 1.0)),
+            "frac_high_weight": float(train_metrics.get("frac_high_weight", 0.0)),
+        })
         return loss, entropy
 
     def append_batch_log(self, batch_result):
@@ -1515,16 +1883,19 @@ class TrainPipeline(object):
                              policy_value_batch_fn,
                              c_puct=self.c_puct,
                              n_playout=self.eval_n_playout,
-                             vl_k=self.vl_k,
-                             n_vl=self.n_vl,
-                             max_oversample=self.max_oversample)
+                              vl_k=self.vl_k,
+                              n_vl=self.n_vl,
+                              max_oversample=self.max_oversample,
+                              tactic_prior_weight=self.tactic_prior_weight)
         pure = MCTS_Pure(c_puct=5, n_playout=self.pure_mcts_playout_num)
         win_cnt = defaultdict(int)
         eval_start = time.time()
         for i in range(n_games):
             game_start = time.time()
+            move_log_prefix = "[eval game {}/{}]".format(i + 1, n_games)
             winner = self.game.start_play(current, pure, start_player=i % 2,
-                                          is_shown=0)
+                                          is_shown=0,
+                                          move_log_prefix=move_log_prefix)
             win_cnt[winner] += 1
             elapsed = time.time() - game_start
             total_elapsed = time.time() - eval_start
@@ -1548,6 +1919,7 @@ class TrainPipeline(object):
         return win_ratio
 
     def run(self):
+        self.tactical_pretrain()
         self.start_async_pipeline()
         try:
             target_updates = self.game_batch_num
@@ -1643,7 +2015,7 @@ def parse_args():
     p.add_argument("--games-per-worker", type=int, default=1)
     p.add_argument("--threads-per-worker", type=int, default=1)
     p.add_argument("--n-playout", type=int, default=800)
-    p.add_argument("--eval-n-playout", type=int, default=1600)
+    p.add_argument("--eval-n-playout", type=int, default=400)
     p.add_argument("--c-puct", type=float, default=3.0)
     p.add_argument("--dirichlet-alpha", type=float, default=0.05)
     p.add_argument("--noise-eps", type=float, default=0.25)
@@ -1662,7 +2034,7 @@ def parse_args():
     p.add_argument("--game-batch-num", type=int, default=1500)
     p.add_argument("--check-freq", type=int, default=50,
                    help="Run policy evaluation every N training updates.")
-    p.add_argument("--eval-games", type=int, default=10)
+    p.add_argument("--eval-games", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=256)
     p.add_argument("--eval-timeout-ms", type=int, default=8)
     p.add_argument("--response-timeout", type=float, default=180.0)
@@ -1670,6 +2042,34 @@ def parse_args():
                    help="Disable evaluator CUDA Graph capture/replay.")
     p.add_argument("--disable-inference-fp16", action="store_true",
                    help="Disable evaluator FP16 + channels_last inference path.")
+    p.add_argument("--tactic-pretrain-steps", type=int, default=100,
+                   help="Auxiliary tactic-head pretraining steps before self-play. Use 0 to disable.")
+    p.add_argument("--tactic-pretrain-samples", type=int, default=2048,
+                   help="Number of generated tactical base samples before D4 augmentation.")
+    p.add_argument("--tactic-pretrain-batch-size", type=int, default=256)
+    p.add_argument("--tactic-pretrain-lr", type=float, default=5e-4)
+    p.add_argument("--tactic-pretrain-workers", type=int, default=1,
+                   help="Number of CPU worker processes for tactical sample generation. 1 keeps the existing single-process behavior; >=2 enables a spawn-based ProcessPoolExecutor (CPU/numpy only, no CUDA in workers).")
+    p.add_argument("--tactic-loss-weight", type=float, default=0.25,
+                   help="Weight for auxiliary tactic BCE loss during policy updates. New self-play data carries B1 tactic labels; old 3-tuple replay still falls back to zero labels. Use 0 to disable.")
+    p.add_argument("--pretrain-tactic-loss-weight", type=float, default=0.5,
+                   help="Auxiliary tactic BCE loss weight used only during tactical pretraining.")
+    p.add_argument("--tactic-sample-weight", type=float, default=1.5,
+                   help="Per-sample policy/value loss boost from tactic labels. 0 disables Step 2 reweighting.")
+    p.add_argument("--forced-ratio", type=float, default=0.6,
+                   help="Target ratio of forced win/block samples in tactical pretraining data.")
+    p.add_argument("--block-value-target", type=float, default=0.3,
+                   help="Value target for forced block tactical pretraining samples.")
+    p.add_argument("--tactic-prior-weight", type=float, default=0.0,
+                   help="Soft MCTS prior multiplier for tactical moves. Default 0 disables P2 so tactics do not bias MCTS search.")
+    p.add_argument("--backbone", choices=("mlp", "mixer"), default="mlp",
+                   help="Policy-value backbone. Default keeps the existing MLP; mixer is opt-in.")
+    p.add_argument("--mixer-dim", type=int, default=128)
+    p.add_argument("--mixer-depth", type=int, default=6)
+    p.add_argument("--mixer-token-hidden", type=int, default=256)
+    p.add_argument("--mixer-ch-hidden", type=int, default=384)
+    p.add_argument("--mixer-value-hidden", type=int, default=128)
+    p.add_argument("--mixer-dropout", type=float, default=0.1)
     p.add_argument("--batch-log-file", default="training_batches.log",
                    help="Path to append one JSON training summary per game batch. Use an empty string to disable.")
     return p.parse_args()
@@ -1710,5 +2110,23 @@ if __name__ == "__main__":
         batch_log_file=args.batch_log_file,
         use_cuda_graphs=not args.disable_cuda_graphs,
         inference_fp16=not args.disable_inference_fp16,
+        tactic_pretrain_steps=args.tactic_pretrain_steps,
+        tactic_pretrain_samples=args.tactic_pretrain_samples,
+        tactic_pretrain_batch_size=args.tactic_pretrain_batch_size,
+        tactic_pretrain_lr=args.tactic_pretrain_lr,
+        tactic_pretrain_workers=args.tactic_pretrain_workers,
+        tactic_loss_weight=args.tactic_loss_weight,
+        pretrain_tactic_loss_weight=args.pretrain_tactic_loss_weight,
+        tactic_prior_weight=args.tactic_prior_weight,
+        forced_ratio=args.forced_ratio,
+        block_value_target=args.block_value_target,
+        tactic_sample_weight=args.tactic_sample_weight,
+        backbone=args.backbone,
+        mixer_dim=args.mixer_dim,
+        mixer_depth=args.mixer_depth,
+        mixer_token_hidden=args.mixer_token_hidden,
+        mixer_ch_hidden=args.mixer_ch_hidden,
+        mixer_value_hidden=args.mixer_value_hidden,
+        mixer_dropout=args.mixer_dropout,
     )
     pipeline.run()
