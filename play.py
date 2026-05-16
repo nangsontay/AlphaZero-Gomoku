@@ -139,7 +139,7 @@ class GomokuGUI:
         else:
             # Use truly pure MCTS (uniform priors + random rollout, no
             # tactical heuristics) as the canonical evaluation opponent.
-            self.opponent = MCTS_Pure(c_puct=5, n_playout=2000, pure=True)
+            self.opponent = MCTS_Pure(c_puct=5, n_playout=2000)
 
         # Xác định ai đi trước (Black luôn đi trước trong Gomoku)
         self.board.init_board(0) # 0 nghĩa là p1 luôn đi trước

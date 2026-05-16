@@ -1372,6 +1372,62 @@ class TrainPipeline(object):
             mixer_value_hidden=self.mixer_value_hidden,
             mixer_dropout=self.mixer_dropout)
 
+        # Patch (c): resume training counters across restarts so warmup(500)
+        # + lr_schedule do NOT restart from zero on every new process (the
+        # bug that left run 2 at a tiny effective LR). Only loaded when an
+        # init_model is given; a fresh run correctly starts at 0.
+        if init_model:
+            self._load_train_state(init_model)
+
+    def _train_state_path_for(self, model_file):
+        return str(model_file) + ".train_state.json"
+
+    def _load_train_state(self, model_file):
+        path = self._train_state_path_for(model_file)
+        if not os.path.exists(path):
+            print("[train-state] no sidecar at '{}'; counters start "
+                  "fresh.".format(path), flush=True)
+            return
+        try:
+            with open(path) as f:
+                st = json.load(f)
+        except (OSError, ValueError) as exc:
+            print("[train-state] failed to read '{}': {}; counters start "
+                  "fresh.".format(path, exc), flush=True)
+            return
+        self.global_update_count = int(st.get(
+            "global_update_count", self.global_update_count))
+        self.best_win_ratio = float(st.get(
+            "best_win_ratio", self.best_win_ratio))
+        self.lr_multiplier = float(st.get(
+            "lr_multiplier", self.lr_multiplier))
+        self.pure_mcts_playout_num = int(st.get(
+            "pure_mcts_playout_num", self.pure_mcts_playout_num))
+        print("[train-state] resumed: global_update_count={}, "
+              "best_win_ratio={:.3f}, lr_multiplier={:.3f}, "
+              "pure_mcts_playout_num={}".format(
+                  self.global_update_count, self.best_win_ratio,
+                  self.lr_multiplier, self.pure_mcts_playout_num), flush=True)
+
+    def _save_train_state(self, model_file="./current_policy.model"):
+        path = self._train_state_path_for(model_file)
+        st = {
+            "global_update_count": int(self.global_update_count),
+            "best_win_ratio": float(self.best_win_ratio),
+            "lr_multiplier": float(self.lr_multiplier),
+            "pure_mcts_playout_num": int(self.pure_mcts_playout_num),
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=2)
+        os.replace(tmp, path)
+
+    def _save_current_policy(self):
+        """Persist the trainer net + resumable counters atomically-ish."""
+        self.policy_value_net.save_model("./current_policy.model")
+        self._save_train_state("./current_policy.model")
+
     def tactical_pretrain(self, steps=None, samples=None, seed=None):
         """Run optional supervised tactical pretraining through full train_step."""
         steps = self.tactic_pretrain_steps if steps is None else max(0, int(steps))
@@ -2275,7 +2331,7 @@ class TrainPipeline(object):
                         self.weight_event.set()
                         print("signaled GPU evaluator weight reload at update {}".format(
                             update_count), flush=True)
-                    self.policy_value_net.save_model("./current_policy.model")
+                    self._save_current_policy()
                     last_save_update = update_count
                 else:
                     print(
@@ -2305,7 +2361,7 @@ class TrainPipeline(object):
                         update_count % self.check_freq == 0):
                     print("current training update: {}".format(update_count), flush=True)
                     win_ratio = self.policy_evaluate(self.eval_games)
-                    self.policy_value_net.save_model("./current_policy.model")
+                    self._save_current_policy()
                     if win_ratio > self.best_win_ratio:
                         print("New best policy!!!!!!!!", flush=True)
                         self.best_win_ratio = win_ratio
@@ -2314,7 +2370,7 @@ class TrainPipeline(object):
                             self.pure_mcts_playout_num += 1000
                             self.best_win_ratio = 0.0
             if last_save_update != update_count:
-                self.policy_value_net.save_model("./current_policy.model")
+                self._save_current_policy()
         except KeyboardInterrupt:
             # Save the model FIRST, before any cleanup that could block, so a
             # second Ctrl+C cannot prevent us from persisting the latest
@@ -2324,6 +2380,8 @@ class TrainPipeline(object):
             for path in ("./interrupt_policy.model", "./current_policy.model"):
                 try:
                     self.policy_value_net.save_model(path)
+                    if path == "./current_policy.model":
+                        self._save_train_state(path)
                     saved_paths.append(path)
                 except BaseException as save_exc:
                     print("Save FAILED for {}: {}".format(path, save_exc),

@@ -6,7 +6,8 @@
 from __future__ import print_function
 import numpy as np
 
-from tactic import get_tactic_label_vector, is_winning_move
+from tactic import (get_tactic_label_vector, is_winning_move,
+                    get_tactic_forced_move)
 
 
 class Board(object):
@@ -292,6 +293,18 @@ class Game(object):
             move, move_probs = player.get_action(self.board,
                                                  temp=cur_temp,
                                                  return_prob=1)
+            # Patch (a): expert-iteration label shaping. When a forced move
+            # exists at THIS state (own win-in-1 or block opponent win-in-1,
+            # symmetric via get_tactic_forced_move), sharpen the POLICY TARGET
+            # to one-hot on it. The move actually played stays the pure-MCTS
+            # `move`, and the value target `winners_z` is untouched (the game
+            # is played out for real), so this is supervised label shaping,
+            # NOT a heuristic in the play/search loop.
+            forced_move, _is_win = get_tactic_forced_move(self.board)
+            if forced_move is not None:
+                shaped = np.zeros_like(move_probs)
+                shaped[int(forced_move)] = 1.0
+                move_probs = shaped
             # store the data
             states.append(self.board.current_state().copy())
             mcts_probs.append(move_probs)
