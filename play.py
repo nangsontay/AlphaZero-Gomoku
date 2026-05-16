@@ -4,6 +4,8 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk
 import torch
+import json
+import os
 from game import Board
 from mcts_alphaZero import MCTSPlayer
 from mcts_pure import MCTSPlayer as MCTS_Pure
@@ -244,9 +246,21 @@ def run():
     try:
         state_dict = torch.load(model_file, map_location="cpu")
         if isinstance(state_dict, dict):
-            if "policy_head.weight" in state_dict and \
-               "embed.proj.weight" in state_dict:
-                policy_out = int(state_dict["policy_head.weight"].shape[0])
+            is_mlp_checkpoint = (
+                "policy_head.weight" in state_dict and
+                "embed.proj.weight" in state_dict
+            )
+            is_mixer_checkpoint = (
+                "policy_head.weight" in state_dict and
+                "embed.weight" in state_dict and
+                any(k.startswith("blocks.") for k in state_dict)
+            )
+            if is_mlp_checkpoint or is_mixer_checkpoint:
+                backbone = "mixer" if is_mixer_checkpoint else "mlp"
+                if backbone == "mixer":
+                    policy_out = int(state_dict["blocks.0.token_mix.0.weight"].shape[1])
+                else:
+                    policy_out = int(state_dict["policy_head.weight"].shape[0])
                 inferred = int(round(policy_out ** 0.5))
                 # E08 guard: refuse non-square boards.
                 if inferred * inferred != policy_out:
@@ -263,9 +277,37 @@ def run():
                         f"checkpoint dimensions."
                     )
                     width = height = inferred
+                kwargs = {"backbone": backbone}
+                if backbone == "mixer":
+                    sidecar_path = model_file + ".json"
+                    if not os.path.exists(sidecar_path):
+                        raise RuntimeError(
+                            f"Refusing to load '{model_file}': mixer checkpoint "
+                            f"requires sidecar '{sidecar_path}' for architecture "
+                            f"parameters."
+                        )
+                    with open(sidecar_path) as f:
+                        meta = json.load(f)
+                    if meta.get("backbone") != "mixer" or \
+                       meta.get("MLP_ARCH_VERSION") != "2.0.0-mixer":
+                        raise RuntimeError(
+                            f"Refusing to load '{model_file}': mixer checkpoint "
+                            f"sidecar does not declare backbone='mixer' and "
+                            f"MLP_ARCH_VERSION='2.0.0-mixer'."
+                        )
+                    mixer = meta.get("mixer") or {}
+                    kwargs.update({
+                        "mixer_dim": mixer.get("dim", 128),
+                        "mixer_depth": mixer.get("depth", 6),
+                        "mixer_token_hidden": mixer.get("token_hidden", 256),
+                        "mixer_ch_hidden": mixer.get("ch_hidden", 384),
+                        "mixer_value_hidden": mixer.get("value_hidden", 128),
+                        "mixer_dropout": mixer.get("dropout", 0.1),
+                    })
                 best_policy = PolicyValueNet(
                     width, height, model_file=model_file, use_gpu=False,
                     search_d4_random=False,  # eval determinism (Cluster F / A16)
+                    **kwargs,
                 )
             else:
                 print(
