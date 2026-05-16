@@ -1236,6 +1236,9 @@ class TrainPipeline(object):
                   forced_ratio=0.6,
                   block_value_target=0.3,
                   tactic_sample_weight=1.5,
+                  min_train_buffer_size=20000,
+                  min_new_positions_per_update=2000,
+                  warmup_game_batches=0,
                   tactic_probe=False,
                   tactic_probe_steps=1000,
                   tactic_probe_samples=5000,
@@ -1277,6 +1280,10 @@ class TrainPipeline(object):
         self.forced_ratio = min(1.0, max(0.0, float(forced_ratio)))
         self.block_value_target = float(block_value_target)
         self.tactic_sample_weight = max(0.0, float(tactic_sample_weight))
+        self.min_train_buffer_size = max(0, int(min_train_buffer_size))
+        self.min_new_positions_per_update = max(0, int(min_new_positions_per_update))
+        self.warmup_game_batches = max(0, int(warmup_game_batches))
+        self.new_positions_since_update = 0
         self.tactic_probe = bool(tactic_probe)
         self.tactic_probe_steps = max(0, int(tactic_probe_steps))
         self.tactic_probe_samples = max(0, int(tactic_probe_samples))
@@ -2222,13 +2229,45 @@ class TrainPipeline(object):
                     max_games=max(1, self.num_workers * self.games_per_worker),
                     timeout=10.0,
                 )
+                self.new_positions_since_update += int(replay_metrics["positions"])
                 print("async loop:{}, updates:{}/{}, drained_games:{}, positions:{}, data_buffer:{}".format(
                     loop_count, update_count, target_updates,
                     replay_metrics["games"], replay_metrics["positions"],
                     len(self.data_buffer)), flush=True)
                 update_metrics = None
-                if len(self.data_buffer) > self.batch_size:
+                skip_reasons = []
+                buffer_len = len(self.data_buffer)
+                if buffer_len <= self.batch_size:
+                    skip_reasons.append(
+                        "batch_size: buffer={} needs>{}".format(
+                            buffer_len, self.batch_size))
+                if (self.min_train_buffer_size > 0 and
+                        buffer_len < self.min_train_buffer_size):
+                    skip_reasons.append(
+                        "min_train_buffer_size: buffer={} needs>={}".format(
+                            buffer_len, self.min_train_buffer_size))
+                if (self.warmup_game_batches > 0 and
+                        loop_count <= self.warmup_game_batches):
+                    skip_reasons.append(
+                        "warmup_game_batches: batch={} needs>{}".format(
+                            loop_count, self.warmup_game_batches))
+                if (self.min_new_positions_per_update > 0 and
+                        self.new_positions_since_update < self.min_new_positions_per_update):
+                    skip_reasons.append(
+                        "min_new_positions_per_update: new_positions={} needs>={}".format(
+                            self.new_positions_since_update,
+                            self.min_new_positions_per_update))
+                if not skip_reasons:
+                    print(
+                        "policy update guard: run; buffer={}, min_buffer={}, new_positions_since_update={}, min_new_positions={}, warmup_batch={}/{}".format(
+                            buffer_len, self.min_train_buffer_size,
+                            self.new_positions_since_update,
+                            self.min_new_positions_per_update,
+                            loop_count, self.warmup_game_batches),
+                        flush=True,
+                    )
                     self.policy_update()
+                    self.new_positions_since_update = 0
                     update_count += 1
                     update_metrics = self.last_update_metrics
                     if update_count % self.weight_push_every == 0:
@@ -2238,16 +2277,28 @@ class TrainPipeline(object):
                             update_count), flush=True)
                     self.policy_value_net.save_model("./current_policy.model")
                     last_save_update = update_count
+                else:
+                    print(
+                        "policy update guard: skip; buffer={}, min_buffer={}, new_positions_since_update={}, min_new_positions={}, warmup_batch={}/{}, reasons={}".format(
+                            buffer_len, self.min_train_buffer_size,
+                            self.new_positions_since_update,
+                            self.min_new_positions_per_update,
+                            loop_count, self.warmup_game_batches,
+                            "; ".join(skip_reasons)),
+                        flush=True,
+                    )
                 self.append_batch_log({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "batch": int(loop_count),
                     "update": int(update_count),
                     "data_buffer": int(len(self.data_buffer)),
+                    "new_positions_since_update": int(self.new_positions_since_update),
                     "episode_len": float(replay_metrics["episode_len"]),
                     "drained_games": int(replay_metrics["games"]),
                     "drained_positions": int(replay_metrics["positions"]),
                     "eval_requests": int(replay_metrics["eval_requests"]),
                     "updated": update_metrics is not None,
+                    "skip_reasons": skip_reasons,
                     "update_metrics": update_metrics,
                 })
                 if (update_count > 0 and update_metrics is not None and
@@ -2319,6 +2370,12 @@ def parse_args():
     p.add_argument("--temp-low", type=float, default=1e-3)
     p.add_argument("--buffer-size", type=int, default=500000)
     p.add_argument("--recent-sample-window", type=int, default=200000)
+    p.add_argument("--min-train-buffer-size", type=int, default=20000,
+                   help="Skip policy updates until replay has at least this many positions. Use <=0 to disable.")
+    p.add_argument("--min-new-positions-per-update", type=int, default=2000,
+                   help="Skip policy updates until this many new self-play positions have been added since the previous update. Use <=0 to disable.")
+    p.add_argument("--warmup-game-batches", type=int, default=0,
+                   help="Collect-only for the first N self-play collection loop iterations. Use <=0 to disable.")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--game-batch-num", type=int, default=1500)
     p.add_argument("--check-freq", type=int, default=50,
@@ -2398,6 +2455,9 @@ if __name__ == "__main__":
         temp_low=args.temp_low,
         buffer_size=args.buffer_size,
         recent_sample_window=args.recent_sample_window,
+        min_train_buffer_size=args.min_train_buffer_size,
+        min_new_positions_per_update=args.min_new_positions_per_update,
+        warmup_game_batches=args.warmup_game_batches,
         batch_size=args.batch_size,
         game_batch_num=args.game_batch_num,
         check_freq=args.check_freq,
