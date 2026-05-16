@@ -1252,7 +1252,9 @@ class TrainPipeline(object):
                   mixer_token_hidden=256,
                   mixer_ch_hidden=384,
                   mixer_value_hidden=128,
-                  mixer_dropout=0.1):
+                  mixer_dropout=0.1,
+                  epochs=2,
+                  kl_targ=0.03):
         self.use_gpu = bool(use_gpu)
         if self.use_gpu and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
@@ -1342,8 +1344,8 @@ class TrainPipeline(object):
         self.batch_size = int(batch_size)
         self.check_freq = max(1, int(check_freq))
         self.data_buffer = deque(maxlen=self.buffer_size)
-        self.epochs = 2
-        self.kl_targ = 0.03
+        self.epochs = max(1, int(epochs))
+        self.kl_targ = float(kl_targ)
         self.global_update_count = 0
         self.weight_push_every = 4
         self.lr_schedule = [
@@ -2436,6 +2438,12 @@ def parse_args():
                    help="Collect-only for the first N self-play collection loop iterations. Use <=0 to disable.")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--game-batch-num", type=int, default=1500)
+    p.add_argument("--epochs", type=int, default=2,
+                   help="Gradient steps per policy_update on the sampled "
+                        "minibatch (early-stops if KL > 4*kl_targ).")
+    p.add_argument("--kl-targ", type=float, default=0.03,
+                   help="Target KL between old/new policy; drives the "
+                        "adaptive lr_multiplier and the per-update early stop.")
     p.add_argument("--check-freq", type=int, default=50,
                    help="Run policy evaluation every N training updates.")
     p.add_argument("--eval-games", type=int, default=1)
@@ -2518,6 +2526,8 @@ if __name__ == "__main__":
         warmup_game_batches=args.warmup_game_batches,
         batch_size=args.batch_size,
         game_batch_num=args.game_batch_num,
+        epochs=args.epochs,
+        kl_targ=args.kl_targ,
         check_freq=args.check_freq,
         eval_games=args.eval_games,
         eval_batch_size=args.eval_batch_size,
