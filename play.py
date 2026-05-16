@@ -279,6 +279,11 @@ def run():
                     width = height = inferred
                 kwargs = {"backbone": backbone}
                 if backbone == "mixer":
+                    inferred_in_channels = int(state_dict["embed.weight"].shape[1])
+                else:
+                    inferred_in_channels = int(state_dict["embed.proj.weight"].shape[1])
+                kwargs["in_channels"] = inferred_in_channels
+                if backbone == "mixer":
                     sidecar_path = model_file + ".json"
                     if not os.path.exists(sidecar_path):
                         raise RuntimeError(

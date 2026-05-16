@@ -6,7 +6,7 @@
 from __future__ import print_function
 import numpy as np
 
-from tactic import get_tactic_label_vector
+from tactic import get_tactic_label_vector, is_winning_move
 
 
 class Board(object):
@@ -15,6 +15,7 @@ class Board(object):
     def __init__(self, **kwargs):
         self.width = int(kwargs.get('width', 15))
         self.height = int(kwargs.get('height', 15))
+        self.in_channels = int(kwargs.get('in_channels', 4))
         self.states = {}
         self.n_in_row = int(kwargs.get('n_in_row', 5))
         self.players = [1, 2]
@@ -44,6 +45,7 @@ class Board(object):
         new = Board.__new__(Board)
         new.width = self.width
         new.height = self.height
+        new.in_channels = self.in_channels
         new.n_in_row = self.n_in_row
         new.players = self.players
         new.states = dict(self.states)
@@ -69,12 +71,20 @@ class Board(object):
             return -1
         return move
 
-    def current_state(self):
+    def current_state(self, in_channels=None):
         """return the board state from the perspective of the current player.
-        state shape: 4*width*height
+
+        Channels 0-3 preserve the legacy AlphaZero representation:
+        current-player stones, opponent stones, last move, and side-to-play.
+        When ``in_channels >= 5``, channel 4 is ``opp_win_here``: legal moves
+        where the opponent would win immediately if the current player does not
+        block.
         """
 
-        square_state = np.zeros((4, self.width, self.height))
+        channels = self.in_channels if in_channels is None else int(in_channels)
+        if channels < 4:
+            raise ValueError('current_state requires at least 4 channels')
+        square_state = np.zeros((channels, self.width, self.height), dtype=np.float32)
         if self.states:
             moves, players = np.array(list(zip(*self.states.items())))
             move_curr = moves[players == self.current_player]
@@ -92,6 +102,13 @@ class Board(object):
         # convention).
         if self.current_player == self.players[0]:
             square_state[3][:, :] = 1.0  # indicate the colour to play
+        if channels >= 5 and self.availables:
+            opp_player = (self.players[0] if self.current_player == self.players[1]
+                          else self.players[1])
+            for move in self.availables:
+                if is_winning_move(self, move, opp_player):
+                    square_state[4][move // self.width,
+                                    move % self.height] = 1.0
         return square_state
 
     def do_move(self, move):

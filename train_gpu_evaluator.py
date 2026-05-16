@@ -173,7 +173,8 @@ def _generate_tactical_samples_raw(board_width=15, board_height=15, n_in_row=5,
                                    num_samples=2048, max_random_moves=36,
                                    seed=None, forced_ratio=0.6,
                                    block_value_target=0.3,
-                                   softmax_temperature=1.0):
+                                   softmax_temperature=1.0,
+                                   in_channels=4):
     """Generate un-augmented tactical 5-tuples
     (state, policy, value, value_mask, tactic).
 
@@ -201,7 +202,8 @@ def _generate_tactical_samples_raw(board_width=15, board_height=15, n_in_row=5,
     softmax_temperature = max(1e-6, float(softmax_temperature))
     while len(samples) < num_samples and attempts < max_attempts:
         attempts += 1
-        board = Board(width=board_width, height=board_height, n_in_row=n_in_row)
+        board = Board(width=board_width, height=board_height, n_in_row=n_in_row,
+                      in_channels=in_channels)
         board.init_board(start_player=rng.randrange(2))
         move_count = rng.randint(max(0, n_in_row - 2), max(0, int(max_random_moves)))
         for _ in range(move_count):
@@ -218,7 +220,7 @@ def _generate_tactical_samples_raw(board_width=15, board_height=15, n_in_row=5,
         tactic_label = get_tactic_label_vector(board)
         if float(tactic_label.max()) <= 0.0:
             continue
-        state = board.current_state().copy().astype(np.float32)
+        state = board.current_state(in_channels).copy().astype(np.float32)
         forced_move, is_win = get_tactic_forced_move(board)
         policy_target = np.zeros(board_size, dtype=np.float32)
         if forced_move is not None:
@@ -269,7 +271,8 @@ def _tactical_samples_worker(arg_tuple):
     _generate_tactical_samples_raw().
     """
     (board_width, board_height, n_in_row, num_samples, max_random_moves,
-     seed, forced_ratio, block_value_target, softmax_temperature) = arg_tuple
+     seed, forced_ratio, block_value_target, softmax_temperature,
+     in_channels) = arg_tuple
     # Pin BLAS/OMP to 1 thread per worker so CPU oversubscription doesn't
     # destroy wall-clock when the parent uses many workers.
     try:
@@ -286,6 +289,7 @@ def _tactical_samples_worker(arg_tuple):
         forced_ratio=forced_ratio,
         block_value_target=block_value_target,
         softmax_temperature=softmax_temperature,
+        in_channels=in_channels,
     )
 
 
@@ -294,7 +298,7 @@ def generate_tactical_samples(board_width=15, board_height=15, n_in_row=5,
                               seed=None, forced_ratio=0.6,
                               block_value_target=0.3,
                               softmax_temperature=1.0,
-                              workers=1):
+                              workers=1, in_channels=4):
     """Generate tactical states with policy, value, and tactic targets.
 
     When ``workers <= 1`` (default) the existing single-process generator is
@@ -320,6 +324,7 @@ def generate_tactical_samples(board_width=15, board_height=15, n_in_row=5,
             forced_ratio=forced_ratio,
             block_value_target=block_value_target,
             softmax_temperature=softmax_temperature,
+            in_channels=in_channels,
         )
         augmented = get_equi_data(raw, board_width, board_height)
         print(
@@ -353,6 +358,7 @@ def generate_tactical_samples(board_width=15, board_height=15, n_in_row=5,
             float(forced_ratio),
             float(block_value_target),
             float(softmax_temperature),
+            int(in_channels),
         ))
 
     t0 = time.time()
@@ -394,7 +400,8 @@ def generate_tactical_samples(board_width=15, board_height=15, n_in_row=5,
 def generate_forced_block_probe_positions(board_width=15, board_height=15,
                                           n_in_row=5, num_positions=200,
                                           max_random_moves=60, seed=None,
-                                          max_attempts=None):
+                                          max_attempts=None,
+                                          in_channels=4):
     """Generate held-out forced-block positions for tactical probe accuracy.
 
     Returns tuples ``(state, forced_move, legal_mask)``.  The generator accepts
@@ -413,7 +420,8 @@ def generate_forced_block_probe_positions(board_width=15, board_height=15,
     attempts = 0
     while len(positions) < num_positions and attempts < max_attempts:
         attempts += 1
-        board = Board(width=board_width, height=board_height, n_in_row=n_in_row)
+        board = Board(width=board_width, height=board_height, n_in_row=n_in_row,
+                      in_channels=in_channels)
         board.init_board(start_player=rng.randrange(2))
         move_count = rng.randint(max(0, n_in_row - 2), max(0, int(max_random_moves)))
         for _ in range(move_count):
@@ -433,7 +441,7 @@ def generate_forced_block_probe_positions(board_width=15, board_height=15,
         legal_mask = np.zeros(board_size, dtype=np.float32)
         legal_mask[np.asarray(board.availables, dtype=np.int64)] = 1.0
         positions.append((
-            board.current_state().copy().astype(np.float32),
+            board.current_state(in_channels).copy().astype(np.float32),
             int(forced_move),
             legal_mask,
         ))
@@ -585,8 +593,8 @@ class RemotePolicyValueClient(object):
     def policy_value_fn(self, board):
         legal_positions = board.availables
         state = np.ascontiguousarray(
-            board.current_state().reshape(
-                4, self.board_width, self.board_height
+            board.current_state(self.in_channels).reshape(
+                self.in_channels, self.board_width, self.board_height
             ).astype(np.float32)
         )
         self.request_id += 1
@@ -627,7 +635,7 @@ class RemotePolicyValueClient(object):
     def policy_value_batch_fn(self, states_np):
         """Evaluate a batch of already-built board state tensors remotely.
 
-        states_np must be shaped (B, 4, board_width, board_height). Full-board
+        states_np must be shaped (B, C, board_width, board_height). Full-board
         priors are returned so MCTS can slice them by each leaf's legal moves.
         """
         states_np = np.ascontiguousarray(states_np, dtype=np.float32)
@@ -1065,7 +1073,9 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
             wid, n_games, n_playout, vl_k, n_vl, max_oversample,
             os.getpid()), flush=True)
 
-        board = Board(width=bw, height=bh, n_in_row=int(args["n_in_row"]))
+        in_channels = int(args.get("in_channels", 4))
+        board = Board(width=bw, height=bh, n_in_row=int(args["n_in_row"]),
+                      in_channels=in_channels)
         game = Game(board)
         client = RemotePolicyValueClient(
             worker_id=wid,
@@ -1079,6 +1089,7 @@ def selfplay_worker_remote(args, request_queue, response_queue, replay_queue,
             shm_in_name=shm_in_name,
             shm_out_name=shm_out_name,
             shm_slots=shm_slots,
+            in_channels=in_channels,
             shutdown_event=shutdown_event,
         )
         mcts_player = MCTSPlayer(client.policy_value_fn,
@@ -1231,6 +1242,7 @@ class TrainPipeline(object):
                   tactic_probe_positions=200,
                   tactic_probe_threshold=0.85,
                   tactic_probe_bug_threshold=0.50,
+                  in_channels=4,
                   backbone="mlp",
                   mixer_dim=128,
                   mixer_depth=6,
@@ -1272,6 +1284,7 @@ class TrainPipeline(object):
         self.tactic_probe_threshold = float(tactic_probe_threshold)
         self.tactic_probe_bug_threshold = float(tactic_probe_bug_threshold)
         self.backbone = str(backbone).lower()
+        self.in_channels = int(in_channels)
         self.mixer_dim = int(mixer_dim)
         self.mixer_depth = int(mixer_depth)
         self.mixer_token_hidden = int(mixer_token_hidden)
@@ -1300,7 +1313,8 @@ class TrainPipeline(object):
         self.board_height = 15
         self.n_in_row = 5
         self.board = Board(width=self.board_width, height=self.board_height,
-                           n_in_row=self.n_in_row)
+                           n_in_row=self.n_in_row,
+                           in_channels=self.in_channels)
         self.game = Game(self.board)
         self.learn_rate = 1e-3
         self.lr_multiplier = 1.0
@@ -1339,6 +1353,7 @@ class TrainPipeline(object):
         self.policy_value_net = PolicyValueNet(
             self.board_width, self.board_height,
             model_file=init_model, use_gpu=self.use_gpu,
+            in_channels=self.in_channels,
             sym_loss_weight=0.0,
             tactic_loss_weight=self.tactic_loss_weight,
             tactic_sample_weight=self.tactic_sample_weight,
@@ -1370,7 +1385,8 @@ class TrainPipeline(object):
             forced_ratio=self.forced_ratio,
             block_value_target=self.block_value_target,
             seed=(int(time.time()) % (2 ** 31 - 1) if seed is None else int(seed)),
-            workers=self.tactic_pretrain_workers)
+            workers=self.tactic_pretrain_workers,
+            in_channels=self.policy_value_net.in_channels)
         if not data:
             print("tactical pretraining skipped: no tactical samples generated", flush=True)
             return []
@@ -1418,6 +1434,7 @@ class TrainPipeline(object):
             num_positions=num_positions,
             max_random_moves=60,
             seed=(int(time.time()) % (2 ** 31 - 1) if seed is None else int(seed)),
+            in_channels=self.policy_value_net.in_channels,
         )
         if not probe:
             metrics = {
@@ -1804,6 +1821,7 @@ class TrainPipeline(object):
                 "threads_per_worker": self.threads_per_worker,
                 "response_timeout": self.response_timeout,
                 "worker_log_every": 2000,
+                "in_channels": self.policy_value_net.in_channels,
             })
         return tasks
 
@@ -2340,6 +2358,8 @@ def parse_args():
                    help="Acceptance target for forced-block top-1 probe accuracy.")
     p.add_argument("--tactic-probe-bug-threshold", type=float, default=0.50,
                    help="Below this forced-block top-1 accuracy, report likely tactical sample generation bug.")
+    p.add_argument("--in-channels", type=int, default=4,
+                   help="Neural-network input channels. 4 preserves legacy checkpoints; 5 enables the opp_win_here must-block tactical plane.")
     p.add_argument("--backbone", choices=("mlp", "mixer"), default="mlp",
                    help="Policy-value backbone. Default keeps the existing MLP; mixer is opt-in.")
     p.add_argument("--mixer-dim", type=int, default=128)
@@ -2404,6 +2424,7 @@ if __name__ == "__main__":
         tactic_probe_positions=args.tactic_probe_positions,
         tactic_probe_threshold=args.tactic_probe_threshold,
         tactic_probe_bug_threshold=args.tactic_probe_bug_threshold,
+        in_channels=args.in_channels,
         backbone=args.backbone,
         mixer_dim=args.mixer_dim,
         mixer_depth=args.mixer_depth,

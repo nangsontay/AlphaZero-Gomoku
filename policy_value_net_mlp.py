@@ -36,7 +36,7 @@ def set_learning_rate(optimizer, lr):
 
 
 def _apply_d4(state, k_rot, do_flip):
-    """state: (4, 15, 15) numpy. Returns transformed state in same shape."""
+    """state: (C, 15, 15) numpy. Returns transformed state in same shape."""
     s = np.rot90(state, k_rot, axes=(1, 2))
     if do_flip:
         s = s[:, :, ::-1]
@@ -62,7 +62,7 @@ def _invert_d4_policy(probs225, k_rot, do_flip, board_w=15, board_h=15):
 class PerCellEmbed(nn.Module):
     """Per-cell shared linear projection.
 
-    Each of the 225 cells' 4-channel feature vector is projected through the
+    Each of the 225 cells' C-channel feature vector is projected through the
     SAME nn.Linear(in_channels -> embed_dim).
     """
 
@@ -388,6 +388,7 @@ class PolicyValueNet:
             self.scaler = legacy_grad_scaler(enabled=self.use_amp)
 
         if model_file:
+            self._maybe_check_sidecar(model_file)
             net_params = torch.load(model_file, map_location=self.device)
             # E03 guard: accept the common "{'state_dict': ...}" wrapping.
             if isinstance(net_params, dict) and "state_dict" in net_params \
@@ -419,10 +420,6 @@ class PolicyValueNet:
                     "and any offline CNN-instantiating conversion tool."
                     .format(model_file)
                 ) from exc
-
-            # v2 addition (§3.6): version-check sidecar if present.
-            self._maybe_check_sidecar(model_file)
-
     # v2 addition (§3.6) — sidecar plumbing.
     def _sidecar_path(self, model_file):
         return model_file + ".json"
@@ -464,11 +461,28 @@ class PolicyValueNet:
             if self.backbone == "mlp" and ver == "1.0.0":
                 print(f"[mlp] WARNING: loading legacy MLP sidecar version '{ver}' "
                       f"with newly initialized tactic head.", flush=True)
-                return
+            else:
+                raise RuntimeError(
+                    f"MLP_ARCH_VERSION mismatch: checkpoint='{ver}' "
+                    f"vs running='{sorted(expected_versions)}'. Refusing to load."
+                )
+        meta_backbone = str(meta.get("backbone", self.backbone)).lower()
+        if meta_backbone != self.backbone:
             raise RuntimeError(
-                f"MLP_ARCH_VERSION mismatch: checkpoint='{ver}' "
-                f"vs running='{sorted(expected_versions)}'. Refusing to load."
+                f"backbone mismatch: checkpoint='{meta_backbone}' "
+                f"vs running='{self.backbone}'. Refusing to load."
             )
+        for key, expected in (("board_width", self.board_width),
+                              ("board_height", self.board_height),
+                              ("in_channels", self.in_channels)):
+            if key not in meta:
+                continue
+            actual = int(meta[key])
+            if actual != int(expected):
+                raise RuntimeError(
+                    f"{key} mismatch: checkpoint={actual} vs running={int(expected)}. "
+                    f"Refusing to load."
+                )
 
     def save_model(self, model_file):
         """save model params to file plus sidecar metadata (v2 §3.6)."""
@@ -545,7 +559,7 @@ class PolicyValueNet:
         legal_positions = board.availables
 
         state = np.ascontiguousarray(
-            board.current_state().reshape(
+            board.current_state(self.in_channels).reshape(
                 -1, self.in_channels, self.board_width, self.board_height
             ).astype(np.float32)
         )
@@ -738,7 +752,7 @@ class PolicyValueNet:
         return loss.item()
 
     def _sym_loss(self, state_batch, log_p_orig):
-        """Symmetry regularisation. state_batch: (N, 4, 15, 15) on self.device.
+        """Symmetry regularisation. state_batch: (N, C, 15, 15) on self.device.
 
         v2 §6: one-sided cross-entropy with a stop-gradient teacher derived
         from the same network on the original state.
