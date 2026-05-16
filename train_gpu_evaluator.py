@@ -391,6 +391,61 @@ def generate_tactical_samples(board_width=15, board_height=15, n_in_row=5,
     return augmented
 
 
+def generate_forced_block_probe_positions(board_width=15, board_height=15,
+                                          n_in_row=5, num_positions=200,
+                                          max_random_moves=60, seed=None,
+                                          max_attempts=None):
+    """Generate held-out forced-block positions for tactical probe accuracy.
+
+    Returns tuples ``(state, forced_move, legal_mask)``.  The generator accepts
+    only positions where the side to move has no immediate win and must block
+    the opponent's immediate win, as determined by ``get_tactic_forced_move``.
+    """
+    rng = random.Random(seed)
+    num_positions = max(0, int(num_positions))
+    board_size = int(board_width) * int(board_height)
+    if max_attempts is None:
+        max_attempts = max(num_positions * 1000, 1000)
+    else:
+        max_attempts = max(int(max_attempts), num_positions)
+
+    positions = []
+    attempts = 0
+    while len(positions) < num_positions and attempts < max_attempts:
+        attempts += 1
+        board = Board(width=board_width, height=board_height, n_in_row=n_in_row)
+        board.init_board(start_player=rng.randrange(2))
+        move_count = rng.randint(max(0, n_in_row - 2), max(0, int(max_random_moves)))
+        for _ in range(move_count):
+            if not board.availables:
+                break
+            move = rng.choice(board.availables)
+            board.do_move(move)
+            end, _ = board.game_end()
+            if end:
+                break
+        end, _ = board.game_end()
+        if end or not board.availables:
+            continue
+        forced_move, is_win = get_tactic_forced_move(board)
+        if forced_move is None or bool(is_win):
+            continue
+        legal_mask = np.zeros(board_size, dtype=np.float32)
+        legal_mask[np.asarray(board.availables, dtype=np.int64)] = 1.0
+        positions.append((
+            board.current_state().copy().astype(np.float32),
+            int(forced_move),
+            legal_mask,
+        ))
+
+    print(
+        "forced-block probe gen: positions={}, attempts={}, target={}".format(
+            len(positions), attempts, num_positions),
+        flush=True,
+    )
+    return positions
+
+
 class RemotePolicyValueClient(object):
     """Worker-side proxy used as MCTS policy_value_fn(board)."""
 
@@ -1160,16 +1215,22 @@ class TrainPipeline(object):
                   worker_model_file="./_tmp_gpu_evaluator_policy.model",
                   batch_log_file="training_batches.log",
                   use_cuda_graphs=True, inference_fp16=True,
-                  tactic_pretrain_steps=100,
-                  tactic_pretrain_samples=2048,
-                  tactic_pretrain_batch_size=256,
-                  tactic_pretrain_lr=5e-4,
+                  tactic_pretrain_steps=10000,
+                  tactic_pretrain_samples=80000,
+                  tactic_pretrain_batch_size=512,
+                  tactic_pretrain_lr=1e-3,
                   tactic_pretrain_workers=1,
                   tactic_loss_weight=0.25,
                   pretrain_tactic_loss_weight=0.5,
                   forced_ratio=0.6,
                   block_value_target=0.3,
                   tactic_sample_weight=1.5,
+                  tactic_probe=False,
+                  tactic_probe_steps=1000,
+                  tactic_probe_samples=5000,
+                  tactic_probe_positions=200,
+                  tactic_probe_threshold=0.85,
+                  tactic_probe_bug_threshold=0.50,
                   backbone="mlp",
                   mixer_dim=128,
                   mixer_depth=6,
@@ -1204,6 +1265,12 @@ class TrainPipeline(object):
         self.forced_ratio = min(1.0, max(0.0, float(forced_ratio)))
         self.block_value_target = float(block_value_target)
         self.tactic_sample_weight = max(0.0, float(tactic_sample_weight))
+        self.tactic_probe = bool(tactic_probe)
+        self.tactic_probe_steps = max(0, int(tactic_probe_steps))
+        self.tactic_probe_samples = max(0, int(tactic_probe_samples))
+        self.tactic_probe_positions = max(1, int(tactic_probe_positions))
+        self.tactic_probe_threshold = float(tactic_probe_threshold)
+        self.tactic_probe_bug_threshold = float(tactic_probe_bug_threshold)
         self.backbone = str(backbone).lower()
         self.mixer_dim = int(mixer_dim)
         self.mixer_depth = int(mixer_depth)
@@ -1283,33 +1350,35 @@ class TrainPipeline(object):
             mixer_value_hidden=self.mixer_value_hidden,
             mixer_dropout=self.mixer_dropout)
 
-    def tactical_pretrain(self):
-        """Run optional supervised pretraining for the auxiliary tactic head."""
-        if self.tactic_pretrain_steps <= 0 or self.tactic_pretrain_samples <= 0:
+    def tactical_pretrain(self, steps=None, samples=None, seed=None):
+        """Run optional supervised tactical pretraining through full train_step."""
+        steps = self.tactic_pretrain_steps if steps is None else max(0, int(steps))
+        samples = self.tactic_pretrain_samples if samples is None else max(0, int(samples))
+        if steps <= 0 or samples <= 0:
             print("tactical pretraining disabled", flush=True)
             return
         gen_mode = "pool" if self.tactic_pretrain_workers > 1 else "single"
         print("tactical pretraining: samples={}, steps={}, batch_size={}, lr={:.6g}, forced_ratio={:.2f}, block_value={:.3f}, gen_mode={}, gen_workers={}".format(
-            self.tactic_pretrain_samples, self.tactic_pretrain_steps,
+            samples, steps,
             self.tactic_pretrain_batch_size, self.tactic_pretrain_lr,
             self.forced_ratio, self.block_value_target,
             gen_mode, self.tactic_pretrain_workers), flush=True)
         data = generate_tactical_samples(
             self.board_width, self.board_height, self.n_in_row,
-            num_samples=self.tactic_pretrain_samples,
+            num_samples=samples,
             max_random_moves=60,
             forced_ratio=self.forced_ratio,
             block_value_target=self.block_value_target,
-            seed=int(time.time()) % (2 ** 31 - 1),
+            seed=(int(time.time()) % (2 ** 31 - 1) if seed is None else int(seed)),
             workers=self.tactic_pretrain_workers)
         if not data:
             print("tactical pretraining skipped: no tactical samples generated", flush=True)
-            return
+            return []
         losses = []
         old_tactic_loss_weight = self.policy_value_net.tactic_loss_weight
         self.policy_value_net.tactic_loss_weight = self.pretrain_tactic_loss_weight
         try:
-            for step in range(self.tactic_pretrain_steps):
+            for step in range(steps):
                 batch_size = min(self.tactic_pretrain_batch_size, len(data))
                 mini_batch = random.sample(data, batch_size)
                 state_batch = [d[0] for d in mini_batch]
@@ -1331,13 +1400,96 @@ class TrainPipeline(object):
                     tactic_mask=tactic_mask,
                     value_mask=value_mask)
                 losses.append(float(loss))
-                if (step + 1) % max(1, self.tactic_pretrain_steps // 5) == 0:
+                if (step + 1) % max(1, steps // 5) == 0:
                     print("tactical pretrain step {}/{}: loss={:.6f}, entropy={:.6f}".format(
-                        step + 1, self.tactic_pretrain_steps, float(loss), float(entropy)), flush=True)
+                        step + 1, steps, float(loss), float(entropy)), flush=True)
         finally:
             self.policy_value_net.tactic_loss_weight = old_tactic_loss_weight
         print("tactical pretraining done: generated_positions={}, mean_loss={:.6f}".format(
             len(data), float(np.nanmean(losses)) if losses else 0.0), flush=True)
+        return data
+
+    def evaluate_forced_block_probe(self, num_positions=None, seed=None):
+        """Evaluate top-1 policy accuracy on held-out forced-block positions."""
+        num_positions = (self.tactic_probe_positions if num_positions is None
+                         else max(1, int(num_positions)))
+        probe = generate_forced_block_probe_positions(
+            self.board_width, self.board_height, self.n_in_row,
+            num_positions=num_positions,
+            max_random_moves=60,
+            seed=(int(time.time()) % (2 ** 31 - 1) if seed is None else int(seed)),
+        )
+        if not probe:
+            metrics = {
+                "positions": 0,
+                "correct": 0,
+                "accuracy": 0.0,
+                "target": float(self.tactic_probe_threshold),
+                "likely_generation_bug": True,
+                "scale_up_recommended": False,
+            }
+            print("forced-block probe: no positions generated; likely probe/sample generation bug", flush=True)
+            return metrics
+
+        states = [p[0] for p in probe]
+        forced_moves = [p[1] for p in probe]
+        legal_masks = [p[2] for p in probe]
+        act_probs, _ = self.policy_value_net.policy_value(states)
+        correct = 0
+        for probs, forced_move, legal_mask in zip(act_probs, forced_moves, legal_masks):
+            masked = np.asarray(probs, dtype=np.float64).copy()
+            masked[np.asarray(legal_mask) <= 0.0] = -np.inf
+            pred = int(np.argmax(masked))
+            if pred == int(forced_move):
+                correct += 1
+        accuracy = float(correct) / float(len(probe))
+        metrics = {
+            "positions": int(len(probe)),
+            "correct": int(correct),
+            "accuracy": float(accuracy),
+            "target": float(self.tactic_probe_threshold),
+            "likely_generation_bug": bool(accuracy < self.tactic_probe_bug_threshold),
+            "scale_up_recommended": bool(accuracy >= self.tactic_probe_threshold),
+        }
+        print(
+            "forced-block probe: accuracy={:.2%} ({}/{}), target={:.2%}".format(
+                accuracy, correct, len(probe), self.tactic_probe_threshold),
+            flush=True,
+        )
+        if accuracy < self.tactic_probe_bug_threshold:
+            print(
+                "forced-block probe: accuracy below {:.0%}; likely bug in tactical sample generation. Do not recommend scale-up.".format(
+                    self.tactic_probe_bug_threshold),
+                flush=True,
+            )
+        elif accuracy < self.tactic_probe_threshold:
+            print(
+                "forced-block probe: below acceptance target; do not recommend scale-up yet.",
+                flush=True,
+            )
+        else:
+            print("forced-block probe: acceptance target met; scale-up is allowed.", flush=True)
+        return metrics
+
+    def run_tactical_probe(self):
+        """Run the small 5k/1000-step probe before any full training run."""
+        print(
+            "tactical probe: pretrain_steps={}, samples={}, eval_forced_blocks={}".format(
+                self.tactic_probe_steps, self.tactic_probe_samples,
+                self.tactic_probe_positions),
+            flush=True,
+        )
+        self.tactical_pretrain(
+            steps=self.tactic_probe_steps,
+            samples=self.tactic_probe_samples,
+            seed=12345,
+        )
+        metrics = self.evaluate_forced_block_probe(
+            num_positions=self.tactic_probe_positions,
+            seed=54321,
+        )
+        print("tactical probe metrics: {}".format(json.dumps(metrics, sort_keys=True)), flush=True)
+        return metrics
 
     def save_cpu_model_for_evaluator(self):
         """Atomically publish a CPU copy of the worker model checkpoint.
@@ -1922,8 +2074,8 @@ class TrainPipeline(object):
 
         if kl > self.kl_targ * 2 and self.lr_multiplier > 0.1:
             self.lr_multiplier /= 1.5
-        elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
-            self.lr_multiplier *= 1.5
+        elif kl < self.kl_targ / 2 and self.lr_multiplier < 5.0:
+            self.lr_multiplier = min(5.0, self.lr_multiplier * 1.5)
 
         winner_np = np.array(winner_batch)
         winner_var = np.var(winner_np)
@@ -2161,12 +2313,12 @@ def parse_args():
                    help="Disable evaluator CUDA Graph capture/replay.")
     p.add_argument("--disable-inference-fp16", action="store_true",
                    help="Disable evaluator FP16 + channels_last inference path.")
-    p.add_argument("--tactic-pretrain-steps", type=int, default=100,
-                   help="Auxiliary tactic-head pretraining steps before self-play. Use 0 to disable.")
-    p.add_argument("--tactic-pretrain-samples", type=int, default=2048,
+    p.add_argument("--tactic-pretrain-steps", type=int, default=10000,
+                   help="Full policy/value/tactic tactical pretraining steps before self-play. Use 0 to disable.")
+    p.add_argument("--tactic-pretrain-samples", type=int, default=80000,
                    help="Number of generated tactical base samples before D4 augmentation.")
-    p.add_argument("--tactic-pretrain-batch-size", type=int, default=256)
-    p.add_argument("--tactic-pretrain-lr", type=float, default=5e-4)
+    p.add_argument("--tactic-pretrain-batch-size", type=int, default=512)
+    p.add_argument("--tactic-pretrain-lr", type=float, default=1e-3)
     p.add_argument("--tactic-pretrain-workers", type=int, default=1,
                    help="Number of CPU worker processes for tactical sample generation. 1 keeps the existing single-process behavior; >=2 enables a spawn-based ProcessPoolExecutor (CPU/numpy only, no CUDA in workers).")
     p.add_argument("--tactic-loss-weight", type=float, default=0.25,
@@ -2179,6 +2331,15 @@ def parse_args():
                    help="Target ratio of forced win/block samples in tactical pretraining data.")
     p.add_argument("--block-value-target", type=float, default=0.3,
                    help="Value target for forced block tactical pretraining samples.")
+    p.add_argument("--tactic-probe", action="store_true",
+                   help="Run only the 5k-sample/1000-step forced-block tactical probe, then exit without self-play or checkpoint writes.")
+    p.add_argument("--tactic-probe-steps", type=int, default=1000)
+    p.add_argument("--tactic-probe-samples", type=int, default=5000)
+    p.add_argument("--tactic-probe-positions", type=int, default=200)
+    p.add_argument("--tactic-probe-threshold", type=float, default=0.85,
+                   help="Acceptance target for forced-block top-1 probe accuracy.")
+    p.add_argument("--tactic-probe-bug-threshold", type=float, default=0.50,
+                   help="Below this forced-block top-1 accuracy, report likely tactical sample generation bug.")
     p.add_argument("--backbone", choices=("mlp", "mixer"), default="mlp",
                    help="Policy-value backbone. Default keeps the existing MLP; mixer is opt-in.")
     p.add_argument("--mixer-dim", type=int, default=128)
@@ -2237,6 +2398,12 @@ if __name__ == "__main__":
         forced_ratio=args.forced_ratio,
         block_value_target=args.block_value_target,
         tactic_sample_weight=args.tactic_sample_weight,
+        tactic_probe=args.tactic_probe,
+        tactic_probe_steps=args.tactic_probe_steps,
+        tactic_probe_samples=args.tactic_probe_samples,
+        tactic_probe_positions=args.tactic_probe_positions,
+        tactic_probe_threshold=args.tactic_probe_threshold,
+        tactic_probe_bug_threshold=args.tactic_probe_bug_threshold,
         backbone=args.backbone,
         mixer_dim=args.mixer_dim,
         mixer_depth=args.mixer_depth,
@@ -2245,4 +2412,7 @@ if __name__ == "__main__":
         mixer_value_hidden=args.mixer_value_hidden,
         mixer_dropout=args.mixer_dropout,
     )
-    pipeline.run()
+    if args.tactic_probe:
+        pipeline.run_tactical_probe()
+    else:
+        pipeline.run()
