@@ -79,7 +79,7 @@ def load_policy(model_file="current_policy.model"):
         kwargs["in_channels"] = int(state_dict["embed.proj.weight"].shape[1])
 
     policy = PolicyValueNet(
-        width, height, model_file=model_file, use_gpu=False,
+        width, height, model_file=model_file, use_gpu=True,
         search_d4_random=False,  # eval determinism
         **kwargs,
     )
