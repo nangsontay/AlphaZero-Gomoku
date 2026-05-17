@@ -6,7 +6,7 @@
   "backbone": "mixer",
   "d4_randomisation": true,
   "tactic_sample_weight": 1.0,
-  "saved_at": "2026-05-17T04:24:56+0000",
+  "saved_at": "2026-05-17T11:13:50+0000",
   "git_sha": "unknown",
   "mixer": {
     "dim": 128,

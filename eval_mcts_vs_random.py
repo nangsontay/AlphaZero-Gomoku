@@ -1,34 +1,76 @@
 # -*- coding: utf-8 -*-
 """
-ĐẠI CHIẾN: MCTS-AlphaZero (policy-value net) VS MCTS-Pure (random rollout)
+ĐẠI CHIẾN: MCTS-AlphaZero (policy-value net) VS Random (legal moves)
 
 Chạy một giải đấu luân phiên màu giữa:
   - MCTS-AlphaZero: tìm kiếm PUCT dẫn dắt bởi mạng policy-value
                     (current_policy.model), giá trị lá lấy từ value head.
-  - MCTS-Pure     : MCTS cổ điển, prior đồng đều + rollout ngẫu nhiên,
-                    không dùng mạng nơ-ron.
+  - Random        : chọn ngẫu nhiên đều trong các nước đi hợp lệ,
+                    không dùng MCTS và không dùng mạng nơ-ron.
 
 Cách dùng:
-    python eval_mcts_vs_pure.py [n_games] [az_playout] [pure_playout]
+    python eval_mcts_vs_random.py [n_games] [az_playout] [device]
 
-Mặc định: 10 ván, AlphaZero 400 playout, Pure 2000 playout.
+Thiết bị policy tùy chọn: auto (mặc định), cuda/gpu, cpu. Có thể đặt qua
+GOMOKU_POLICY_DEVICE nếu không truyền đối số thứ 3.
+
+Mặc định: 10 ván, AlphaZero 400 playout.
 """
 
 import os
 import sys
 import json
 import time
+import random
 
-import numpy as np
 import torch
 
 from game import Board
 from mcts_alphaZero import MCTSPlayer as AlphaZeroPlayer
-from mcts_pure import MCTSPlayer as PureMCTSPlayer
 from policy_value_net_mlp import PolicyValueNet
 
 
-def load_policy(model_file="current_policy.model"):
+class RandomPlayer(object):
+    """Agent chơi ngẫu nhiên, tuân thủ luật."""
+
+    def __init__(self):
+        self.player = None
+
+    def set_player_ind(self, p):
+        self.player = p
+
+    def get_action(self, board):
+        if len(board.availables) > 0:
+            return random.choice(board.availables)
+        print("WARNING: the board is full")
+
+    def __str__(self):
+        return "Random Player {}".format(self.player)
+
+
+def resolve_policy_device(device_arg=None):
+    """Resolve policy device preference while preserving CPU fallback."""
+    requested = (device_arg or os.environ.get("GOMOKU_POLICY_DEVICE") or "auto")
+    requested = requested.strip().lower()
+    if requested in ("", "auto"):
+        use_gpu = torch.cuda.is_available()
+    elif requested in ("cuda", "gpu"):
+        use_gpu = torch.cuda.is_available()
+        if not use_gpu:
+            print("WARNING: requested CUDA policy device but CUDA is not "
+                  "available; falling back to CPU.", flush=True)
+    elif requested == "cpu":
+        use_gpu = False
+    else:
+        raise RuntimeError(
+            "Invalid policy device '{}'. Use auto, cuda/gpu, or cpu."
+            .format(requested))
+
+    device = torch.device("cuda" if use_gpu else "cpu")
+    return use_gpu, device, requested
+
+
+def load_policy(model_file="current_policy.model", device_arg=None):
     """Nạp checkpoint pure-MLP/Mixer giống hệt logic trong play.py."""
     width = height = 15
     if not os.path.exists(model_file):
@@ -78,19 +120,20 @@ def load_policy(model_file="current_policy.model"):
     else:
         kwargs["in_channels"] = int(state_dict["embed.proj.weight"].shape[1])
 
+    use_gpu, requested_device, requested_backend = resolve_policy_device(device_arg)
     policy = PolicyValueNet(
-        width, height, model_file=model_file, use_gpu=True,
+        width, height, model_file=model_file, use_gpu=use_gpu,
         search_d4_random=False,  # eval determinism
         **kwargs,
     )
-    return policy, width, height, kwargs["in_channels"]
+    return policy, width, height, kwargs["in_channels"], requested_backend, requested_device
 
 
-def play_one_game(board, az_player, pure_player, az_is_black,
-                   take_center=True):
+def play_one_game(board, az_player, random_player, az_is_black,
+                  take_center=True):
     """Đánh một ván headless. Trả về (winner_tag, n_moves).
 
-    winner_tag: 'AZ', 'PURE', hoặc 'DRAW'.
+    winner_tag: 'AZ', 'RANDOM', hoặc 'DRAW'.
     az_is_black: True nếu AlphaZero cầm Đen (đi trước).
     """
     board.init_board(0)  # players[0] luôn đi trước
@@ -98,11 +141,11 @@ def play_one_game(board, az_player, pure_player, az_is_black,
 
     if az_is_black:
         az_player.set_player_ind(p1)
-        pure_player.set_player_ind(p2)
+        random_player.set_player_ind(p2)
     else:
         az_player.set_player_ind(p2)
-        pure_player.set_player_ind(p1)
-    players = {az_player.player: az_player, pure_player.player: pure_player}
+        random_player.set_player_ind(p1)
+    players = {az_player.player: az_player, random_player.player: random_player}
 
     n_moves = 0
     first_move_done = False
@@ -115,7 +158,7 @@ def play_one_game(board, az_player, pure_player, az_is_black,
         if (take_center and not first_move_done and
                 center in board.availables):
             move = center
-            who = "AZ" if player_in_turn is az_player else "PURE"
+            who = "AZ" if player_in_turn is az_player else "RANDOM"
             print(f"  \U0001F52E Trực giác: Ô trung tâm còn trống, "
                   f"{who} chiếm luôn!")
         else:
@@ -126,7 +169,7 @@ def play_one_game(board, az_player, pure_player, az_is_black,
         n_moves += 1
 
         # Báo nước đi cho đối thủ để tái sử dụng cây tìm kiếm (nếu có).
-        other = pure_player if player_in_turn is az_player else az_player
+        other = random_player if player_in_turn is az_player else az_player
         if hasattr(other, "notify_opponent_move"):
             other.notify_opponent_move(move)
 
@@ -134,50 +177,54 @@ def play_one_game(board, az_player, pure_player, az_is_black,
         if end:
             if winner == -1:
                 return "DRAW", n_moves
-            return ("AZ" if winner == az_player.player else "PURE"), n_moves
+            return ("AZ" if winner == az_player.player else "RANDOM"), n_moves
 
 
 def main():
     n_games = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-    az_playout = int(sys.argv[2]) if len(sys.argv) > 2 else 500
-    pure_playout = int(sys.argv[3]) if len(sys.argv) > 3 else 500
+    az_playout = int(sys.argv[2]) if len(sys.argv) > 2 else 400
+    device_arg = sys.argv[3] if len(sys.argv) > 3 else None
     model_file = "current_policy.model"
 
     print("\U0001F4E6 Đang nạp các đấu thủ vào RAM...")
-    policy, width, height, in_ch = load_policy(model_file)
+    policy, width, height, in_ch, requested_backend, requested_device = load_policy(
+        model_file, device_arg=device_arg)
+    device_name = (torch.cuda.get_device_name(0) if policy.use_gpu else "CPU")
     print(f"   Model: {model_file} | backbone in_channels={in_ch} "
           f"| bàn {width}x{height}")
+    print(f"   Policy backend: {policy.backbone} | requested_device={requested_backend} "
+          f"| selected_device={policy.device} | torch_device={requested_device} "
+          f"| device_name={device_name}")
     print()
     print(f"\U0001F680 BẮT ĐẦU ĐẠI CHIẾN: "
-          f"MCTS-AlphaZero ({az_playout} playout) VS "
-          f"MCTS-Pure ({pure_playout} playout)")
+          f"MCTS-AlphaZero ({az_playout} playout) VS Random")
     print("=" * 78)
 
-    az_wins = pure_wins = draws = 0
+    az_wins = random_wins = draws = 0
     for g in range(1, n_games + 1):
         # Đấu thủ mới mỗi ván để cây tìm kiếm không bị lẫn trạng thái cũ.
         az_player = AlphaZeroPlayer(
             policy.policy_value_fn,
             policy_value_batch_function=policy.policy_value,
             c_puct=5, n_playout=az_playout)
-        pure_player = PureMCTSPlayer(c_puct=5, n_playout=pure_playout)
+        random_player = RandomPlayer()
         board = Board(width=width, height=height, n_in_row=5,
                       in_channels=in_ch)
 
         az_is_black = (g % 2 == 1)  # luân phiên màu mỗi ván
         t0 = time.time()
-        tag, n_moves = play_one_game(board, az_player, pure_player,
+        tag, n_moves = play_one_game(board, az_player, random_player,
                                      az_is_black)
         dt = time.time() - t0
 
         az_color = "Đen" if az_is_black else "Trắng"
-        pure_color = "Trắng" if az_is_black else "Đen"
+        random_color = "Trắng" if az_is_black else "Đen"
         if tag == "AZ":
             result = f"AlphaZero ({az_color}) THẮNG \U0001F3C6"
             az_wins += 1
-        elif tag == "PURE":
-            result = f"Pure ({pure_color}) THẮNG \U0001F3C6"
-            pure_wins += 1
+        elif tag == "RANDOM":
+            result = f"Random ({random_color}) THẮNG \U0001F3C6"
+            random_wins += 1
         else:
             result = "HÒA"
             draws += 1
@@ -190,7 +237,7 @@ def main():
     print("\U0001F4CA TỔNG KẾT LUÂN PHIÊN")
     print("=" * 78)
     print(f"  - AlphaZero thắng : {az_wins}/{n_games}")
-    print(f"  - Pure MCTS thắng : {pure_wins}/{n_games}")
+    print(f"  - Random thắng    : {random_wins}/{n_games}")
     print(f"  - Hòa             : {draws}/{n_games}")
 
 

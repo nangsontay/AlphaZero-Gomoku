@@ -1,7 +1,7 @@
 {
-  "global_update_count": 1404,
+  "global_update_count": 3625,
   "best_win_ratio": 0.0,
-  "lr_multiplier": 3.3333333333333335,
+  "lr_multiplier": 5.0,
   "pure_mcts_playout_num": 400,
-  "saved_at": "2026-05-17T04:24:56+0000"
+  "saved_at": "2026-05-17T11:13:50+0000"
 }
